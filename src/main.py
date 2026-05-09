@@ -669,6 +669,278 @@ class ICMPv6:
         return "\n".join(lines) + "\n"
 
 
+class DNS:
+    """DNS parser — RFC 1035."""
+
+    class QType(IntEnum):
+        A = 1
+        NS = 2
+        CNAME = 5
+        SOA = 6
+        PTR = 12
+        MX = 15
+        AAAA = 28
+        TXT = 16
+        SRV = 33
+        ANY = 255
+
+    class QClass(IntEnum):
+        IN = 1  # Internet
+        CS = 2  # CSNET
+        CH = 3  # CHAOS
+        HS = 4  # Hesiod
+        ANY = 255
+
+    class RCode(IntEnum):
+        NO_ERROR = 0
+        FORMAT_ERROR = 1
+        SERVER_FAIL = 2
+        NAME_ERROR = 3  # NXDOMAIN
+        NOT_IMPLEMENTED = 4
+        REFUSED = 5
+
+    def __init__(self, data: bytes) -> None:
+        # DNS header structure (12 bytes fixed):
+        # [ ID (2B) ][ Flags (2B) ][ QDCOUNT (2B) ][ ANCOUNT (2B) ]
+        # [ NSCOUNT (2B) ][ ARCOUNT (2B) ]
+        self.id = int.from_bytes(data[0:2], "big")
+
+        # Flags word:
+        # [ QR (1b) ][ Opcode (4b) ][ AA (1b) ][ TC (1b) ][ RD (1b) ]
+        # [ RA (1b) ][ Z (1b) ][ AD (1b) ][ CD (1b) ][ RCODE (4b) ]
+        flags = int.from_bytes(data[2:4], "big")
+        self.qr = bool((flags >> 15) & 0x1)  # 0 = query, 1 = response
+        self.opcode = (flags >> 11) & 0xF
+        self.flag_aa = bool((flags >> 10) & 0x1)  # authoritative answer
+        self.flag_tc = bool((flags >> 9) & 0x1)  # truncated
+        self.flag_rd = bool((flags >> 8) & 0x1)  # recursion desired
+        self.flag_ra = bool((flags >> 7) & 0x1)  # recursion available
+        self.flag_ad = bool((flags >> 5) & 0x1)  # authentic data (DNSSEC)
+        self.flag_cd = bool((flags >> 4) & 0x1)  # checking disabled (DNSSEC)
+        self.rcode = flags & 0xF
+
+        self.qdcount = int.from_bytes(data[4:6], "big")  # question count
+        self.ancount = int.from_bytes(data[6:8], "big")  # answer count
+        self.nscount = int.from_bytes(data[8:10], "big")  # authority count
+        self.arcount = int.from_bytes(data[10:12], "big")  # additional count
+
+        # Parse sections
+        offset = 12
+        self.questions = []
+        self.answers = []
+        self.authorities = []
+        self.additionals = []
+
+        for _ in range(self.qdcount):
+            q, offset = self._parse_question(data, offset)
+            self.questions.append(q)
+
+        for _ in range(self.ancount):
+            rr, offset = self._parse_rr(data, offset)
+            self.answers.append(rr)
+
+        for _ in range(self.nscount):
+            rr, offset = self._parse_rr(data, offset)
+            self.authorities.append(rr)
+
+        for _ in range(self.arcount):
+            rr, offset = self._parse_rr(data, offset)
+            self.additionals.append(rr)
+
+    def _parse_name(self, data: bytes, offset: int) -> tuple[str, int]:
+        """
+        Parse a DNS name at the given offset, following compression pointers
+        (RFC 1035 section 4.1.4). Returns the name and the offset just after
+        the name field (not after any pointer target).
+        """
+        labels = []
+        visited = set()  # guard against pointer loops
+        end_offset = None  # offset to return — set on first pointer jump
+
+        while True:
+            if offset in visited:
+                raise ValueError(f"DNS name compression loop at offset {offset}")
+            visited.add(offset)
+
+            length = data[offset]
+
+            if length == 0:
+                # End of name
+                offset += 1
+                break
+
+            elif (length & 0xC0) == 0xC0:
+                # Compression pointer (2 bytes): upper 2 bits are 11
+                if end_offset is None:
+                    end_offset = offset + 2  # caller resumes after the pointer
+                pointer = int.from_bytes(data[offset : offset + 2], "big") & 0x3FFF
+                offset = pointer
+
+            else:
+                # Regular label
+                offset += 1
+                labels.append(
+                    data[offset : offset + length].decode("ascii", errors="replace")
+                )
+                offset += length
+
+        return ".".join(labels), (end_offset if end_offset is not None else offset)
+
+    def _parse_question(self, data: bytes, offset: int) -> tuple[dict, int]:
+        """Parse a DNS question entry."""
+        name, offset = self._parse_name(data, offset)
+        qtype = int.from_bytes(data[offset : offset + 2], "big")
+        offset += 2
+        qclass = int.from_bytes(data[offset : offset + 2], "big")
+        offset += 2
+        return {"name": name, "qtype": qtype, "qclass": qclass}, offset
+
+    def _parse_rr(self, data: bytes, offset: int) -> tuple[dict, int]:
+        """Parse a DNS resource record."""
+        name, offset = self._parse_name(data, offset)
+        rtype = int.from_bytes(data[offset : offset + 2], "big")
+        offset += 2
+        rclass = int.from_bytes(data[offset : offset + 2], "big")
+        offset += 2
+        ttl = int.from_bytes(data[offset : offset + 4], "big")
+        offset += 4
+        rdlength = int.from_bytes(data[offset : offset + 2], "big")
+        offset += 2
+        rdata = data[offset : offset + rdlength]
+        offset += rdlength
+
+        # Decode rdata based on type
+        rdata_decoded = self._decode_rdata(data, rtype, rdata, offset - rdlength)
+
+        return {
+            "name": name,
+            "rtype": rtype,
+            "rclass": rclass,
+            "ttl": ttl,
+            "rdata": rdata_decoded,
+        }, offset
+
+    def _decode_rdata(self, data: bytes, rtype: int, rdata: bytes, offset: int) -> str:
+        """Decode rdata field into a human-readable string."""
+        try:
+            if rtype == self.QType.A:
+                return socket.inet_ntoa(rdata)
+
+            elif rtype == self.QType.AAAA:
+                return socket.inet_ntop(socket.AF_INET6, rdata)
+
+            elif rtype in (self.QType.NS, self.QType.CNAME, self.QType.PTR):
+                name, _ = self._parse_name(data, offset)
+                return name
+
+            elif rtype == self.QType.MX:
+                preference = int.from_bytes(rdata[0:2], "big")
+                exchange, _ = self._parse_name(data, offset + 2)
+                return f"{preference} {exchange}"
+
+            elif rtype == self.QType.TXT:
+                # TXT rdata: [ length (1B) ][ string ]... (may be multiple strings)
+                strings = []
+                i = 0
+                while i < len(rdata):
+                    slen = rdata[i]
+                    i += 1
+                    strings.append(
+                        rdata[i : i + slen].decode("utf-8", errors="replace")
+                    )
+                    i += slen
+                return " | ".join(strings)
+
+            elif rtype == self.QType.SOA:
+                # [ MNAME ][ RNAME ][ Serial (4B) ][ Refresh (4B) ]
+                # [ Retry (4B) ][ Expire (4B) ][ Minimum (4B) ]
+                mname, off = self._parse_name(data, offset)
+                rname, off = self._parse_name(data, off)
+                serial = int.from_bytes(data[off : off + 4], "big")
+                return f"mname={mname} rname={rname} serial={serial}"
+
+            elif rtype == self.QType.SRV:
+                # [ Priority (2B) ][ Weight (2B) ][ Port (2B) ][ Target ]
+                priority = int.from_bytes(rdata[0:2], "big")
+                weight = int.from_bytes(rdata[2:4], "big")
+                port = int.from_bytes(rdata[4:6], "big")
+                target, _ = self._parse_name(data, offset + 6)
+                return f"{priority} {weight} {port} {target}"
+
+        except Exception:
+            pass
+
+        return rdata.hex()  # fallback for unknown/malformed rdata
+
+    def qtype_name(self, qtype: int) -> str:
+        try:
+            return self.QType(qtype).name
+        except ValueError:
+            return str(qtype)
+
+    def qclass_name(self, qclass: int) -> str:
+        try:
+            return self.QClass(qclass).name
+        except ValueError:
+            return str(qclass)
+
+    def rcode_name(self) -> str:
+        try:
+            return self.RCode(self.rcode).name.replace("_", " ").title()
+        except ValueError:
+            return f"Unknown ({self.rcode})"
+
+    def _fmt_section(self, records: list[dict], label: str) -> list[str]:
+        if not records:
+            return []
+        lines = [f"\n  {label}:"]
+        for rr in records:
+            lines.append(
+                f"    {rr['name']:<30} "
+                f"{rr['ttl']:<8} "
+                f"{self.qclass_name(rr['rclass']):<6} "
+                f"{self.qtype_name(rr['rtype']):<8} "
+                f"{rr['rdata']}"
+            )
+        return lines
+
+    def __str__(self) -> str:
+        lines = [
+            "--- DNS ".ljust(50, "-"),
+            f"id          = {hex(self.id)},",
+            f"type        = {'Response' if self.qr else 'Query'},",
+            f"opcode      = {self.opcode},",
+            f"rcode       = {self.rcode} ({self.rcode_name()}),",
+            f"flags       = "
+            f"{'AA ' if self.flag_aa else ''}"
+            f"{'TC ' if self.flag_tc else ''}"
+            f"{'RD ' if self.flag_rd else ''}"
+            f"{'RA ' if self.flag_ra else ''}"
+            f"{'AD ' if self.flag_ad else ''}"
+            f"{'CD ' if self.flag_cd else ''}".strip() + ",",
+            f"questions   = {self.qdcount},",
+            f"answers     = {self.ancount},",
+            f"authorities = {self.nscount},",
+            f"additionals = {self.arcount},",
+        ]
+
+        # Questions section
+        if self.questions:
+            lines.append("\n  Questions:")
+            for q in self.questions:
+                lines.append(
+                    f"    {q['name']:<30} "
+                    f"{self.qclass_name(q['qclass']):<6} "
+                    f"{self.qtype_name(q['qtype'])}"
+                )
+
+        lines += self._fmt_section(self.answers, "Answers")
+        lines += self._fmt_section(self.authorities, "Authorities")
+        lines += self._fmt_section(self.additionals, "Additionals")
+
+        return "\n".join(lines) + "\n"
+
+
 @app.command()
 def main(file: Annotated[str, typer.Argument(help="Raw packet binary file")]):
     # Read raw packet file
@@ -729,6 +1001,14 @@ def main(file: Annotated[str, typer.Argument(help="Raw packet binary file")]):
             raise typer.Exit(1)
         udp = UDP(pkg.data)
         typer.echo(udp)
+
+        # DNS runs on port 53 (query or response)
+        if udp.src_port == Port.DNS or udp.dst_port == Port.DNS:
+            if len(udp.data) < 12:
+                typer.echo("Error: DNS payload too short.", err=True)
+                raise typer.Exit(1)
+            dns = DNS(udp.data)
+            typer.echo(dns)
 
     elif protocol == Protocol.TCP:
         if len(pkg.data) < 20:
