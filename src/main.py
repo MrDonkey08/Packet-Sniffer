@@ -156,6 +156,74 @@ class UDP:
         )
 
 
+class TCP:
+    def __init__(self, segment: bytes) -> None:
+        self.src_port = int.from_bytes(segment[0:2], "big")
+        self.dst_port = int.from_bytes(segment[2:4], "big")
+        self.seq_num = int.from_bytes(segment[4:8], "big")
+        self.ack_num = int.from_bytes(segment[8:12], "big")
+
+        # Data Offset (4b) and Reserved (3b) share byte 12 with NS flag (1b)
+        self.data_offset = (segment[12] >> 4) & 0xF  # in 32-bit words
+        header_length = self.data_offset * 4  # actual length in bytes
+
+        # Flags spread across bytes 12-13:
+        # byte 12: [Data Offset (4b)][Reserved (3b)][NS (1b)]
+        # byte 13: [CWR][ECE][URG][ACK][PSH][RST][SYN][FIN]
+        flags_word = int.from_bytes(segment[12:14], "big")
+        self.flag_ns = bool(flags_word & 0x100)
+        self.flag_cwr = bool(flags_word & 0x080)
+        self.flag_ece = bool(flags_word & 0x040)
+        self.flag_urg = bool(flags_word & 0x020)
+        self.flag_ack = bool(flags_word & 0x010)
+        self.flag_psh = bool(flags_word & 0x008)
+        self.flag_rst = bool(flags_word & 0x004)
+        self.flag_syn = bool(flags_word & 0x002)
+        self.flag_fin = bool(flags_word & 0x001)
+
+        self.window_size = int.from_bytes(segment[14:16], "big")
+        self.checksum = int.from_bytes(segment[16:18], "big")
+        self.urgent_pointer = int.from_bytes(
+            segment[18:20], "big"
+        )  # only meaningful if URG is set
+
+        # Options present if data_offset > 5 (i.e., header > 20 bytes)
+        self.options = segment[20:header_length] if self.data_offset > 5 else None
+
+        self.data = segment[header_length:]
+
+    def flag_str(self) -> str:
+        names = ["NS", "CWR", "ECE", "URG", "ACK", "PSH", "RST", "SYN", "FIN"]
+        values = [
+            self.flag_ns,
+            self.flag_cwr,
+            self.flag_ece,
+            self.flag_urg,
+            self.flag_ack,
+            self.flag_psh,
+            self.flag_rst,
+            self.flag_syn,
+            self.flag_fin,
+        ]
+        active = [name for name, val in zip(names, values) if val]
+        return ", ".join(active) if active else "None"
+
+    def __str__(self) -> str:
+        return (
+            "--- TCP ".ljust(50, "-") + "\n"
+            f"src_port    = {self.src_port},\n"
+            f"dst_port    = {self.dst_port},\n"
+            f"seq_num     = {self.seq_num},\n"
+            f"ack_num     = {self.ack_num},\n"
+            f"data_offset = {self.data_offset} ({self.data_offset * 4} bytes),\n"
+            f"flags       = {self.flag_str()},\n"
+            f"window_size = {self.window_size},\n"
+            f"checksum    = {hex(self.checksum)},\n"
+            f"urgent_ptr  = {self.urgent_pointer},\n"
+            f"options     = {self.options.hex() if self.options else None}\n"
+        )
+
+
 @app.command()
 def main(file: Annotated[str, typer.Argument(help="Raw packet binary file")]):
     # Read raw packet file
@@ -214,7 +282,11 @@ def main(file: Annotated[str, typer.Argument(help="Raw packet binary file")]):
         typer.echo(udp)
 
     elif protocol == PROTO_TCP:
-        typer.echo("TCP packet detected — no further parsing implemented.")
+        if len(pkg.data) < 20:
+            typer.echo("Error: TCP segment too short.", err=True)
+            raise typer.Exit(1)
+        tcp = TCP(pkg.data)
+        typer.echo(tcp)
 
     elif protocol == PROTO_ICMP:
         typer.echo("ICMP packet detected — no further parsing implemented.")
