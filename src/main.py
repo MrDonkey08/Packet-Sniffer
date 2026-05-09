@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 
-from enum import IntEnum
+from enum import IntEnum, Enum
 from typing import Annotated
 import typer
 import socket
@@ -1492,6 +1492,155 @@ class DHCPv6:
         return "\n".join(lines) + "\n"
 
 
+class HTTP:
+    """HTTP/1.x parser — RFC 7230/7231."""
+
+    class Method(str, Enum):
+        GET = "GET"
+        POST = "POST"
+        PUT = "PUT"
+        DELETE = "DELETE"
+        HEAD = "HEAD"
+        OPTIONS = "OPTIONS"
+        PATCH = "PATCH"
+        TRACE = "TRACE"
+        CONNECT = "CONNECT"
+
+    class Version(str, Enum):
+        HTTP_1_0 = "HTTP/1.0"
+        HTTP_1_1 = "HTTP/1.1"
+
+    # Common status code ranges
+    STATUS_RANGES = {
+        1: "Informational",
+        2: "Success",
+        3: "Redirection",
+        4: "Client Error",
+        5: "Server Error",
+    }
+
+    def __init__(self, data: bytes) -> None:
+        # HTTP/1.x is text-based — decode as UTF-8 with fallback
+        try:
+            text = data.decode("utf-8")
+        except UnicodeDecodeError:
+            text = data.decode("latin-1")
+
+        # Headers and body are separated by a blank line (CRLF CRLF)
+        if "\r\n\r\n" in text:
+            header_section, self.body = text.split("\r\n\r\n", 1)
+        else:
+            header_section = text
+            self.body = ""
+
+        lines = header_section.split("\r\n")
+        start_line = lines[0]
+
+        # Determine if request or response from the start line
+        if start_line.startswith("HTTP/"):
+            self.is_response = True
+            self.is_request = False
+            self._parse_response(start_line)
+        else:
+            self.is_request = True
+            self.is_response = False
+            self._parse_request(start_line)
+
+        # Parse headers — [ Field Name ]: [ Field Value ]
+        self.headers: dict[str, str] = {}
+        for line in lines[1:]:
+            if ": " in line:
+                name, _, value = line.partition(": ")
+                self.headers[name.lower()] = value.strip()
+
+        # Decode body if transfer-encoding is chunked
+        if self.headers.get("transfer-encoding", "").lower() == "chunked":
+            self.body = self._decode_chunked(self.body)
+
+    def _parse_request(self, start_line: str) -> None:
+        """Parse HTTP request line — [ Method ][ SP ][ Request-URI ][ SP ][ Version ]"""
+        parts = start_line.split(" ", 2)
+        self.method = parts[0] if len(parts) > 0 else "?"
+        self.uri = parts[1] if len(parts) > 1 else "?"
+        self.version = parts[2] if len(parts) > 2 else "?"
+        self.status_code = None
+        self.reason_phrase = None
+
+    def _parse_response(self, start_line: str) -> None:
+        """Parse HTTP response line — [ Version ][ SP ][ Status Code ][ SP ][ Reason ]"""
+        parts = start_line.split(" ", 2)
+        self.version = parts[0] if len(parts) > 0 else "?"
+        self.status_code = (
+            int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else None
+        )
+        self.reason_phrase = parts[2] if len(parts) > 2 else "?"
+        self.method = None
+        self.uri = None
+
+    def _decode_chunked(self, body: str) -> str:
+        """Decode chunked transfer encoding — RFC 7230 section 4.1."""
+        decoded = []
+        lines = body.split("\r\n")
+        i = 0
+        try:
+            while i < len(lines):
+                # Chunk size is a hex number, optionally followed by chunk extensions
+                size = int(lines[i].split(";")[0].strip(), 16)
+                i += 1
+                if size == 0:
+                    break
+                decoded.append(lines[i][:size])
+                i += 1
+                i += 1  # skip trailing CRLF after chunk data
+        except ValueError, IndexError:
+            return body  # return raw if decoding fails
+        return "".join(decoded)
+
+    def status_range(self) -> str:
+        if self.status_code is None:
+            return ""
+        return self.STATUS_RANGES.get(self.status_code // 100, "Unknown")
+
+    def content_type(self) -> str:
+        return self.headers.get("content-type", "unknown")
+
+    def content_length(self) -> int | None:
+        val = self.headers.get("content-length")
+        return int(val) if val and val.isdigit() else None
+
+    def __str__(self) -> str:
+        lines = ["--- HTTP/1.x ".ljust(50, "-")]
+
+        if self.is_request:
+            lines += [
+                "type     = Request,",
+                f"method  = {self.method},",
+                f"uri     = {self.uri},",
+                f"version = {self.version},",
+            ]
+        else:
+            lines += [
+                "type     = Response,",
+                f"version = {self.version},",
+                f"status  = {self.status_code} {self.reason_phrase}"
+                f" ({self.status_range()}),",
+            ]
+
+        if self.headers:
+            lines.append("\n  Headers:")
+            for name, value in self.headers.items():
+                lines.append(f"    {name:<30} {value}")
+
+        if self.body:
+            # Truncate large bodies to avoid flooding the terminal
+            preview = self.body[:256].replace("\r\n", " ").replace("\n", " ")
+            if len(self.body) > 256:
+                preview += f" ... ({len(self.body)} bytes total)"
+            lines.append(f"\n  Body:\n    {preview}")
+
+        return "\n".join(lines) + "\n"
+
+
 @app.command()
 def main(file: Annotated[str, typer.Argument(help="Raw packet binary file")]):
     # Read raw packet file
@@ -1587,6 +1736,14 @@ def main(file: Annotated[str, typer.Argument(help="Raw packet binary file")]):
             raise typer.Exit(1)
         tcp = TCP(pkg.data)
         typer.echo(tcp)
+
+        if tcp.src_port in (Port.HTTP, Port.HTTPS) or tcp.dst_port in (
+            Port.HTTP,
+            Port.HTTPS,
+        ):
+            if tcp.data:
+                http = HTTP(tcp.data)
+                typer.echo(http)
 
     elif protocol == Protocol.ICMPv4:
         if len(pkg.data) < 8:
