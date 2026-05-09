@@ -941,6 +941,250 @@ class DNS:
         return "\n".join(lines) + "\n"
 
 
+class DHCPv4:
+    """DHCPv4 parser — RFC 2131 / RFC 2132."""
+
+    class MessageType(IntEnum):
+        DISCOVER = 1
+        OFFER = 2
+        REQUEST = 3
+        DECLINE = 4
+        ACK = 5
+        NAK = 6
+        RELEASE = 7
+        INFORM = 8
+
+    class OpCode(IntEnum):
+        REQUEST = 1  # client -> server
+        REPLY = 2  # server -> client
+
+    class HardwareType(IntEnum):
+        ETHERNET = 1
+        IEEE_802 = 6
+        ARCNET = 7
+        LOCALTALK = 11
+        LOCALNET = 12
+        SMDS = 14
+        FRAME_RELAY = 15
+        ATM = 16
+        HDLC = 17
+        FIBRE_CHANNEL = 18
+        ATM_2 = 19
+        SERIAL = 20
+
+    # DHCP option codes — RFC 2132
+    class Option(IntEnum):
+        SUBNET_MASK = 1
+        ROUTER = 3
+        DNS_SERVER = 6
+        HOST_NAME = 12
+        DOMAIN_NAME = 15
+        BROADCAST_ADDR = 28
+        REQUESTED_IP = 50
+        LEASE_TIME = 51
+        MSG_TYPE = 53
+        SERVER_ID = 54
+        PARAM_REQUEST_LIST = 55
+        MAX_MSG_SIZE = 57
+        RENEWAL_TIME = 58
+        REBINDING_TIME = 59
+        VENDOR_CLASS_ID = 60
+        CLIENT_ID = 61
+        DOMAIN_SEARCH = 119
+        CLASSLESS_ROUTE = 121
+        END = 255
+
+    # Magic cookie that marks the start of DHCP options (RFC 2131)
+    MAGIC_COOKIE = b"\x63\x82\x53\x63"
+
+    def __init__(self, data: bytes) -> None:
+        # DHCPv4 base header structure (236 bytes fixed):
+        # [ Op (1B) ][ HType (1B) ][ HLen (1B) ][ Hops (1B) ]
+        # [ XID (4B) ][ Secs (2B) ][ Flags (2B) ]
+        # [ CIAddr (4B) ][ YIAddr (4B) ][ SIAddr (4B) ][ GIAddr (4B) ]
+        # [ CHAddr (16B) ][ SName (64B) ][ File (128B) ]
+        # [ Magic Cookie (4B) ][ Options (variable) ]
+        self.op = data[0]
+        self.htype = data[1]
+        self.hlen = data[2]  # hardware address length
+        self.hops = data[3]
+
+        self.xid = int.from_bytes(data[4:8], "big")  # transaction ID
+        self.secs = int.from_bytes(data[8:10], "big")  # seconds since start
+        flags = int.from_bytes(data[10:12], "big")
+        self.flag_broadcast = bool((flags >> 15) & 0x1)  # broadcast flag
+
+        self.ciaddr = data[12:16]  # client IP (if already has one)
+        self.yiaddr = data[16:20]  # your IP (offered/assigned by server)
+        self.siaddr = data[20:24]  # next server IP (e.g., for TFTP boot)
+        self.giaddr = data[24:28]  # relay agent IP
+
+        # CHAddr is fixed 16B but only hlen bytes are meaningful
+        self.chaddr = data[28 : 28 + self.hlen]
+
+        self.sname = (
+            data[44:108].rstrip(b"\x00").decode("ascii", errors="replace")
+        )  # server name
+        self.file = (
+            data[108:236].rstrip(b"\x00").decode("ascii", errors="replace")
+        )  # boot file
+
+        # Options — must start with magic cookie
+        self.options: dict[int, object] = {}
+        if data[236:240] == self.MAGIC_COOKIE:
+            self.options = self._parse_options(data[240:])
+
+    def _parse_options(self, data: bytes) -> dict[int, object]:
+        """Parse DHCP options TLV encoding — RFC 2132."""
+        options = {}
+        i = 0
+        while i < len(data):
+            code = data[i]
+            i += 1
+
+            if code == 0:  # Pad option — no length byte
+                continue
+            if code == 255:  # End option — stop parsing
+                break
+
+            length = data[i]
+            i += 1
+            value = data[i : i + length]
+            i += length
+
+            options[code] = self._decode_option(code, value)
+
+        return options
+
+    def _decode_option(self, code: int, value: bytes) -> object:
+        """Decode a DHCP option value into a human-readable form."""
+        try:
+            opt = self.Option(code)
+
+            if opt == self.Option.MSG_TYPE:
+                return self.MessageType(value[0]).name.replace("_", " ").title()
+
+            elif opt in (
+                self.Option.SUBNET_MASK,
+                self.Option.ROUTER,
+                self.Option.DNS_SERVER,
+                self.Option.BROADCAST_ADDR,
+                self.Option.REQUESTED_IP,
+                self.Option.SERVER_ID,
+            ):
+                # One or more IPv4 addresses (4B each)
+                addrs = [
+                    socket.inet_ntoa(value[j : j + 4]) for j in range(0, len(value), 4)
+                ]
+                return ", ".join(addrs)
+
+            elif opt in (
+                self.Option.LEASE_TIME,
+                self.Option.RENEWAL_TIME,
+                self.Option.REBINDING_TIME,
+            ):
+                return f"{int.from_bytes(value, 'big')}s"
+
+            elif opt == self.Option.MAX_MSG_SIZE:
+                return str(int.from_bytes(value, "big"))
+
+            elif opt in (
+                self.Option.HOST_NAME,
+                self.Option.DOMAIN_NAME,
+                self.Option.VENDOR_CLASS_ID,
+            ):
+                return value.decode("ascii", errors="replace")
+
+            elif opt == self.Option.CLIENT_ID:
+                # [ HType (1B) ][ Client Hardware Address ]
+                htype = value[0]
+                addr = value[1:]
+                return f"htype={htype} addr={addr.hex(':')}"
+
+            elif opt == self.Option.PARAM_REQUEST_LIST:
+                # List of requested option codes
+                names = []
+                for code in value:
+                    try:
+                        names.append(self.Option(code).name)
+                    except ValueError:
+                        names.append(str(code))
+                return ", ".join(names)
+
+            elif opt == self.Option.CLASSLESS_ROUTE:
+                # [ Mask Length (1B) ][ Significant Octets ][ Router (4B) ]
+                routes = []
+                j = 0
+                while j < len(value):
+                    mask_len = value[j]
+                    j += 1
+                    sig_bytes = (mask_len + 7) // 8
+                    network = value[j : j + sig_bytes].ljust(4, b"\x00")
+                    j += sig_bytes
+                    router = socket.inet_ntoa(value[j : j + 4])
+                    j += 4
+                    routes.append(
+                        f"{socket.inet_ntoa(network)}/{mask_len} via {router}"
+                    )
+                return ", ".join(routes)
+
+        except ValueError, IndexError:
+            pass
+
+        return value.hex()  # fallback for unknown/malformed options
+
+    def op_name(self) -> str:
+        try:
+            return self.OpCode(self.op).name.title()
+        except ValueError:
+            return f"Unknown ({self.op})"
+
+    def htype_name(self) -> str:
+        try:
+            return self.HardwareType(self.htype).name.replace("_", " ").title()
+        except ValueError:
+            return f"Unknown ({self.htype})"
+
+    def format_ip(self, ip: bytes) -> str:
+        return socket.inet_ntoa(ip)
+
+    def format_mac(self, mac: bytes) -> str:
+        return mac.hex(":")
+
+    def __str__(self) -> str:
+        lines = [
+            "--- DHCPv4 ".ljust(50, "-"),
+            f"op             = {self.op} ({self.op_name()}),",
+            f"htype          = {self.htype} ({self.htype_name()}),",
+            f"hlen           = {self.hlen},",
+            f"hops           = {self.hops},",
+            f"xid            = {hex(self.xid)},",
+            f"secs           = {self.secs},",
+            f"flag_broadcast = {self.flag_broadcast},",
+            f"ciaddr         = {self.format_ip(self.ciaddr)},",
+            f"yiaddr         = {self.format_ip(self.yiaddr)},",
+            f"siaddr         = {self.format_ip(self.siaddr)},",
+            f"giaddr         = {self.format_ip(self.giaddr)},",
+            f"chaddr         = {self.format_mac(self.chaddr)},",
+        ]
+
+        if self.sname:
+            lines.append(f"sname         = {self.sname},")
+        if self.file:
+            lines.append(f"file          = {self.file},")
+
+        if self.options:
+            lines.append("\n  Options:")
+            for code, value in self.options.items():
+                try:
+                    name = self.Option(code).name
+                except ValueError:
+                    name = f"Option({code})"
+                lines.append(f"    {name:<24} {value}")
+
+        return "\n".join(lines) + "\n"
+
+
 @app.command()
 def main(file: Annotated[str, typer.Argument(help="Raw packet binary file")]):
     # Read raw packet file
@@ -1009,6 +1253,16 @@ def main(file: Annotated[str, typer.Argument(help="Raw packet binary file")]):
                 raise typer.Exit(1)
             dns = DNS(udp.data)
             typer.echo(dns)
+
+        elif udp.src_port in (Port.DHCP_SERVER, Port.DHCP_CLIENT) or udp.dst_port in (
+            Port.DHCP_SERVER,
+            Port.DHCP_CLIENT,
+        ):
+            if len(udp.data) < 240:
+                typer.echo("Error: DHCPv4 payload too short.", err=True)
+                raise typer.Exit(1)
+            dhcp = DHCPv4(udp.data)
+            typer.echo(dhcp)
 
     elif protocol == Protocol.TCP:
         if len(pkg.data) < 20:
