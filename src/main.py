@@ -48,6 +48,8 @@ class Port(IntEnum):
     LDAP = 389
     HTTPS = 443
     SMTPS = 465
+    DHCP_V6_CLIENT = 546
+    DHCP_V6_SERVER = 547
     SMTP_ALT = 587  # SMTP submission (RFC 6409)
     LDAPS = 636
     IMAPS = 993
@@ -1185,6 +1187,311 @@ class DHCPv4:
         return "\n".join(lines) + "\n"
 
 
+class DHCPv6:
+    """DHCPv6 parser — RFC 8415."""
+
+    class MessageType(IntEnum):
+        SOLICIT = 1
+        ADVERTISE = 2
+        REQUEST = 3
+        CONFIRM = 4
+        RENEW = 5
+        REBIND = 6
+        REPLY = 7
+        RELEASE = 8
+        DECLINE = 9
+        RECONFIGURE = 10
+        INFO_REQUEST = 11
+        RELAY_FORW = 12
+        RELAY_REPL = 13
+
+    class OptionCode(IntEnum):
+        CLIENT_ID = 1
+        SERVER_ID = 2
+        IA_NA = 3  # Identity Association for Non-temporary Addresses
+        IA_TA = 4  # Identity Association for Temporary Addresses
+        IA_ADDR = 5
+        ORO = 6  # Option Request Option
+        PREFERENCE = 7
+        ELAPSED_TIME = 8
+        RELAY_MSG = 9
+        AUTH = 11
+        UNICAST = 12
+        STATUS_CODE = 13
+        RAPID_COMMIT = 14
+        USER_CLASS = 15
+        VENDOR_CLASS = 16
+        VENDOR_OPTS = 17
+        INTERFACE_ID = 18
+        RECONF_MSG = 19
+        RECONF_ACCEPT = 20
+        DNS_SERVERS = 23  # RFC 3646
+        DOMAIN_LIST = 24  # RFC 3646
+        IA_PD = 25  # RFC 3633 — Prefix Delegation
+        IA_PREFIX = 26  # RFC 3633
+        NTP_SERVER = 56  # RFC 5908
+        BOOTFILE_URL = 59  # RFC 5970
+        BOOTFILE_PARAM = 60  # RFC 5970
+        CLIENT_ARCH_TYPE = 61  # RFC 5970
+        NII = 62  # RFC 5970
+        FQDN = 72  # RFC 4704
+        SOL_MAX_RT = 82  # RFC 7083
+        INF_MAX_RT = 83  # RFC 7083
+
+    class StatusCode(IntEnum):
+        SUCCESS = 0
+        UNSPEC_FAIL = 1
+        NO_ADDRS_AVAIL = 2
+        NO_BINDING = 3
+        NOT_ON_LINK = 4
+        USE_MULTICAST = 5
+        NO_PREFIX_AVAIL = 6
+
+    class DUIDType(IntEnum):
+        LLT = 1  # Link-layer address + time
+        EN = 2  # Enterprise number
+        LL = 3  # Link-layer address
+        UUID = 4  # RFC 6355
+
+    def __init__(self, data: bytes) -> None:
+        self.msg_type = data[0]
+
+        # Relay messages (RELAY_FORW/RELAY_REPL) have a different structure:
+        # [ Msg Type (1B) ][ Hop Count (1B) ][ Link Address (16B) ][ Peer Address (16B) ]
+        # [ Options (variable) ]
+        if self.msg_type in (self.MessageType.RELAY_FORW, self.MessageType.RELAY_REPL):
+            self.hop_count = data[1]
+            self.link_address = data[2:18]
+            self.peer_address = data[18:34]
+            self.options = self._parse_options(data[34:])
+            self.xid = None
+
+        # Regular messages:
+        # [ Msg Type (1B) ][ Transaction ID (3B) ][ Options (variable) ]
+        else:
+            self.hop_count = None
+            self.link_address = None
+            self.peer_address = None
+            self.xid = int.from_bytes(data[1:4], "big")
+            self.options = self._parse_options(data[4:])
+
+    def _parse_options(self, data: bytes) -> dict[int, object]:
+        """Parse DHCPv6 options — RFC 8415 section 21.
+        All options use:  [ Code (2B) ][ Length (2B) ][ Value (Length B) ]
+        """
+        options = {}
+        i = 0
+        while i + 4 <= len(data):
+            code = int.from_bytes(data[i : i + 2], "big")
+            i += 2
+            length = int.from_bytes(data[i : i + 2], "big")
+            i += 2
+            value = data[i : i + length]
+            i += length
+            options[code] = self._decode_option(code, value, data)
+        return options
+
+    def _decode_duid(self, data: bytes) -> str:
+        """Decode a DUID (DHCP Unique Identifier) — RFC 8415 section 11."""
+        if len(data) < 2:
+            return data.hex()
+        duid_type = int.from_bytes(data[0:2], "big")
+        try:
+            dtype = self.DUIDType(duid_type)
+            if dtype == self.DUIDType.LLT:
+                # [ Type (2B) ][ HW Type (2B) ][ Time (4B) ][ LL Addr (variable) ]
+                hw_type = int.from_bytes(data[2:4], "big")
+                time = int.from_bytes(data[4:8], "big")
+                ll_addr = data[8:].hex(":")
+                return f"LLT hw_type={hw_type} time={time} addr={ll_addr}"
+            elif dtype == self.DUIDType.EN:
+                # [ Type (2B) ][ Enterprise Number (4B) ][ Identifier (variable) ]
+                en = int.from_bytes(data[2:6], "big")
+                uid = data[6:].hex()
+                return f"EN enterprise={en} id={uid}"
+            elif dtype == self.DUIDType.LL:
+                # [ Type (2B) ][ HW Type (2B) ][ LL Addr (variable) ]
+                hw_type = int.from_bytes(data[2:4], "big")
+                ll_addr = data[4:].hex(":")
+                return f"LL hw_type={hw_type} addr={ll_addr}"
+            elif dtype == self.DUIDType.UUID:
+                return f"UUID {data[2:].hex()}"
+        except ValueError:
+            pass
+        return data.hex()
+
+    def _decode_option(self, code: int, value: bytes, full_data: bytes) -> object:
+        """Decode a DHCPv6 option value into a human-readable form."""
+        try:
+            opt = self.OptionCode(code)
+
+            if opt in (self.OptionCode.CLIENT_ID, self.OptionCode.SERVER_ID):
+                return self._decode_duid(value)
+
+            elif opt == self.OptionCode.IA_NA:
+                # [ IAID (4B) ][ T1 (4B) ][ T2 (4B) ][ Options (variable) ]
+                iaid = int.from_bytes(value[0:4], "big")
+                t1 = int.from_bytes(value[4:8], "big")
+                t2 = int.from_bytes(value[8:12], "big")
+                sub = self._parse_options(value[12:])
+                return f"iaid={hex(iaid)} t1={t1}s t2={t2}s options={sub}"
+
+            elif opt == self.OptionCode.IA_TA:
+                # [ IAID (4B) ][ Options (variable) ]
+                iaid = int.from_bytes(value[0:4], "big")
+                sub = self._parse_options(value[4:])
+                return f"iaid={hex(iaid)} options={sub}"
+
+            elif opt == self.OptionCode.IA_ADDR:
+                # [ Address (16B) ][ Preferred Lifetime (4B) ][ Valid Lifetime (4B) ]
+                addr = socket.inet_ntop(socket.AF_INET6, value[0:16])
+                preferred = int.from_bytes(value[16:20], "big")
+                valid = int.from_bytes(value[20:24], "big")
+                return f"{addr} preferred={preferred}s valid={valid}s"
+
+            elif opt == self.OptionCode.IA_PD:
+                # [ IAID (4B) ][ T1 (4B) ][ T2 (4B) ][ Options (variable) ]
+                iaid = int.from_bytes(value[0:4], "big")
+                t1 = int.from_bytes(value[4:8], "big")
+                t2 = int.from_bytes(value[8:12], "big")
+                sub = self._parse_options(value[12:])
+                return f"iaid={hex(iaid)} t1={t1}s t2={t2}s options={sub}"
+
+            elif opt == self.OptionCode.IA_PREFIX:
+                # [ Preferred Lifetime (4B) ][ Valid Lifetime (4B) ]
+                # [ Prefix Length (1B) ][ Prefix (16B) ]
+                preferred = int.from_bytes(value[0:4], "big")
+                valid = int.from_bytes(value[4:8], "big")
+                prefix_len = value[8]
+                prefix = socket.inet_ntop(socket.AF_INET6, value[9:25])
+                return f"{prefix}/{prefix_len} preferred={preferred}s valid={valid}s"
+
+            elif opt == self.OptionCode.ORO:
+                # List of requested option codes (2B each)
+                codes = []
+                for j in range(0, len(value), 2):
+                    c = int.from_bytes(value[j : j + 2], "big")
+                    try:
+                        codes.append(self.OptionCode(c).name)
+                    except ValueError:
+                        codes.append(str(c))
+                return ", ".join(codes)
+
+            elif opt == self.OptionCode.PREFERENCE:
+                return str(value[0])
+
+            elif opt == self.OptionCode.ELAPSED_TIME:
+                # In hundredths of a second
+                return f"{int.from_bytes(value, 'big') / 100:.2f}s"
+
+            elif opt == self.OptionCode.STATUS_CODE:
+                code_val = int.from_bytes(value[0:2], "big")
+                msg = value[2:].decode("utf-8", errors="replace")
+                try:
+                    status = self.StatusCode(code_val).name.replace("_", " ").title()
+                except ValueError:
+                    status = str(code_val)
+                return f"{status}: {msg}" if msg else status
+
+            elif opt == self.OptionCode.DNS_SERVERS:
+                addrs = [
+                    socket.inet_ntop(socket.AF_INET6, value[j : j + 16])
+                    for j in range(0, len(value), 16)
+                ]
+                return ", ".join(addrs)
+
+            elif opt == self.OptionCode.DOMAIN_LIST:
+                # Encoded as DNS wire format names
+                names = []
+                j = 0
+                while j < len(value):
+                    name, j = self._parse_dns_name(value, j)
+                    if name:
+                        names.append(name)
+                return ", ".join(names)
+
+            elif opt == self.OptionCode.RELAY_MSG:
+                # Encapsulated DHCPv6 message
+                inner = DHCPv6(value)
+                return f"<encapsulated: {inner.msg_type_name()}>"
+
+            elif opt in (self.OptionCode.RAPID_COMMIT, self.OptionCode.RECONF_ACCEPT):
+                return "present"  # zero-length options — presence is the signal
+
+            elif opt == self.OptionCode.UNICAST:
+                return socket.inet_ntop(socket.AF_INET6, value)
+
+            elif opt == self.OptionCode.FQDN:
+                # [ Flags (1B) ][ Domain Name (DNS wire format) ]
+                flags = value[0]
+                name, _ = self._parse_dns_name(value, 1)
+                return f"flags={bin(flags)} name={name}"
+
+            elif opt in (self.OptionCode.SOL_MAX_RT, self.OptionCode.INF_MAX_RT):
+                return f"{int.from_bytes(value, 'big')}s"
+
+            elif opt == self.OptionCode.VENDOR_CLASS:
+                en = int.from_bytes(value[0:4], "big")
+                return f"enterprise={en} data={value[4:].hex()}"
+
+            elif opt == self.OptionCode.BOOTFILE_URL:
+                return value.decode("utf-8", errors="replace")
+
+        except ValueError, IndexError:
+            pass
+
+        return value.hex()  # fallback for unknown/malformed options
+
+    def _parse_dns_name(self, data: bytes, offset: int) -> tuple[str, int]:
+        """Parse a DNS wire-format name (used in DOMAIN_LIST and FQDN options)."""
+        labels = []
+        while offset < len(data):
+            length = data[offset]
+            offset += 1
+            if length == 0:
+                break
+            labels.append(
+                data[offset : offset + length].decode("ascii", errors="replace")
+            )
+            offset += length
+        return ".".join(labels), offset
+
+    def msg_type_name(self) -> str:
+        try:
+            return self.MessageType(self.msg_type).name.replace("_", " ").title()
+        except ValueError:
+            return f"Unknown ({self.msg_type})"
+
+    def __str__(self) -> str:
+        lines = [
+            "--- DHCPv6 ".ljust(50, "-"),
+            f"msg_type      = {self.msg_type} ({self.msg_type_name()}),",
+        ]
+
+        if self.xid is not None:
+            lines.append(f"xid           = {hex(self.xid)},")
+
+        if self.hop_count is not None:
+            assert self.link_address is not None
+            assert self.peer_address is not None
+            lines += [
+                f"hop_count     = {self.hop_count},",
+                f"link_address  = {socket.inet_ntop(socket.AF_INET6, self.link_address)},",
+                f"peer_address  = {socket.inet_ntop(socket.AF_INET6, self.peer_address)},",
+            ]
+
+        if self.options:
+            lines.append("\n  Options:")
+            for code, value in self.options.items():
+                try:
+                    name = self.OptionCode(code).name
+                except ValueError:
+                    name = f"Option({code})"
+                lines.append(f"    {name:<24} {value}")
+
+        return "\n".join(lines) + "\n"
+
+
 @app.command()
 def main(file: Annotated[str, typer.Argument(help="Raw packet binary file")]):
     # Read raw packet file
@@ -1262,6 +1569,16 @@ def main(file: Annotated[str, typer.Argument(help="Raw packet binary file")]):
                 typer.echo("Error: DHCPv4 payload too short.", err=True)
                 raise typer.Exit(1)
             dhcp = DHCPv4(udp.data)
+            typer.echo(dhcp)
+
+        elif udp.src_port in (
+            Port.DHCP_V6_CLIENT,
+            Port.DHCP_V6_SERVER,
+        ) or udp.dst_port in (Port.DHCP_V6_CLIENT, Port.DHCP_V6_SERVER):
+            if len(udp.data) < 4:
+                typer.echo("Error: DHCPv6 payload too short.", err=True)
+                raise typer.Exit(1)
+            dhcp = DHCPv6(udp.data)
             typer.echo(dhcp)
 
     elif protocol == Protocol.TCP:
