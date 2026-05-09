@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 from enum import IntEnum, Enum
+import struct
 from typing import Annotated
 import typer
 import socket
@@ -1641,6 +1642,576 @@ class HTTP:
         return "\n".join(lines) + "\n"
 
 
+class ONC_RPC:
+    """ONC RPC parser — RFC 5531.
+    NFS, Mount, and other RPC-based protocols share this header.
+    """
+
+    class MessageType(IntEnum):
+        CALL = 0
+        REPLY = 1
+
+    class ReplyStatus(IntEnum):
+        MSG_ACCEPTED = 0
+        MSG_DENIED = 1
+
+    class AcceptStatus(IntEnum):
+        SUCCESS = 0  # RPC call executed successfully
+        PROG_UNAVAIL = 1  # remote program unavailable
+        PROG_MISMATCH = 2  # remote program version mismatch
+        PROC_UNAVAIL = 3  # procedure unavailable
+        GARBAGE_ARGS = 4  # unable to decode arguments
+        SYSTEM_ERR = 5  # system error
+
+    class RejectStatus(IntEnum):
+        RPC_MISMATCH = 0  # RPC version mismatch
+        AUTH_ERROR = 1  # authentication error
+
+    class AuthFlavor(IntEnum):
+        AUTH_NONE = 0
+        AUTH_SYS = 1  # UNIX-style auth
+        AUTH_SHORT = 2
+        AUTH_DH = 3
+        RPCSEC_GSS = 6
+
+    def __init__(self, data: bytes) -> None:
+        # ONC RPC message structure:
+        # [ XID (4B) ][ Message Type (4B) ][ Body (variable) ]
+        self.xid = int.from_bytes(data[0:4], "big")
+        self.msg_type = int.from_bytes(data[4:8], "big")
+
+        offset = 8
+
+        if self.msg_type == self.MessageType.CALL:
+            offset = self._parse_call(data, offset)
+        elif self.msg_type == self.MessageType.REPLY:
+            offset = self._parse_reply(data, offset)
+
+        self.data = data[offset:]
+
+    def _parse_auth(self, data: bytes, offset: int) -> tuple[dict, int]:
+        """Parse an ONC RPC auth credential/verifier field.
+        [ Flavor (4B) ][ Length (4B) ][ Body (Length B) ]
+        """
+        flavor = int.from_bytes(data[offset : offset + 4], "big")
+        offset += 4
+        length = int.from_bytes(data[offset : offset + 4], "big")
+        offset += 4
+        body = data[offset : offset + length]
+        offset += length
+
+        decoded: dict = {"flavor": flavor, "length": length}
+
+        if flavor == self.AuthFlavor.AUTH_SYS and length >= 12:
+            # [ Stamp (4B) ][ Machine Name (4B len + str) ][ UID (4B) ][ GID (4B) ]
+            # [ GIDs (4B count + 4B each) ]
+            stamp = int.from_bytes(body[0:4], "big")
+            name_len = int.from_bytes(body[4:8], "big")
+            name = body[8 : 8 + name_len].decode("ascii", errors="replace")
+            off = 8 + name_len
+            off += (4 - name_len % 4) % 4  # XDR 4-byte alignment
+            uid = int.from_bytes(body[off : off + 4], "big")
+            off += 4
+            gid = int.from_bytes(body[off : off + 4], "big")
+            off += 4
+            gid_count = int.from_bytes(body[off : off + 4], "big")
+            off += 4
+            gids = [
+                int.from_bytes(body[off + j * 4 : off + j * 4 + 4], "big")
+                for j in range(gid_count)
+            ]
+            decoded.update(
+                {
+                    "stamp": stamp,
+                    "machine": name,
+                    "uid": uid,
+                    "gid": gid,
+                    "gids": gids,
+                }
+            )
+
+        return decoded, offset
+
+    def _parse_call(self, data: bytes, offset: int) -> int:
+        """Parse RPC call body.
+        [ RPC Version (4B) ][ Program (4B) ][ Prog Version (4B) ]
+        [ Procedure (4B) ][ Credentials ][ Verifier ]
+        """
+        self.rpc_version = int.from_bytes(data[offset : offset + 4], "big")
+        offset += 4
+        self.program = int.from_bytes(data[offset : offset + 4], "big")
+        offset += 4
+        self.prog_version = int.from_bytes(data[offset : offset + 4], "big")
+        offset += 4
+        self.procedure = int.from_bytes(data[offset : offset + 4], "big")
+        offset += 4
+        self.cred, offset = self._parse_auth(data, offset)  # credentials
+        self.verf, offset = self._parse_auth(data, offset)  # verifier
+        # Reply-specific fields
+        self.reply_status = None
+        self.accept_status = None
+        self.reject_status = None
+        return offset
+
+    def _parse_reply(self, data: bytes, offset: int) -> int:
+        """Parse RPC reply body.
+        [ Reply Status (4B) ][ Verifier (accepted) or Reject Status ][ Accept Status ]
+        """
+        self.reply_status = int.from_bytes(data[offset : offset + 4], "big")
+        offset += 4
+        self.rpc_version = None
+        self.program = None
+        self.prog_version = None
+        self.procedure = None
+        self.cred = None
+
+        if self.reply_status == self.ReplyStatus.MSG_ACCEPTED:
+            self.verf, offset = self._parse_auth(data, offset)
+            self.accept_status = int.from_bytes(data[offset : offset + 4], "big")
+            offset += 4
+            self.reject_status = None
+        elif self.reply_status == self.ReplyStatus.MSG_DENIED:
+            self.verf = None
+            self.accept_status = None
+            self.reject_status = int.from_bytes(data[offset : offset + 4], "big")
+            offset += 4
+        else:
+            self.verf = None
+            self.accept_status = None
+            self.reject_status = None
+
+        return offset
+
+    def msg_type_name(self) -> str:
+        try:
+            return self.MessageType(self.msg_type).name.title()
+        except ValueError:
+            return f"Unknown ({self.msg_type})"
+
+    def accept_status_name(self) -> str:
+        try:
+            return self.AcceptStatus(self.accept_status).name.replace("_", " ").title()
+        except ValueError:
+            return f"Unknown ({self.accept_status})"
+
+    def program_name(self) -> str:
+        if self.program is None:
+            return "N/A"
+        return {
+            100003: "NFS",
+            100005: "Mount",
+            100021: "NLM (Lock Manager)",
+            100024: "Status Monitor",
+        }.get(self.program, f"Unknown ({self.program})")
+
+    def __str__(self) -> str:
+        lines = [
+            "--- ONC RPC ".ljust(50, "-"),
+            f"xid           = {hex(self.xid)},",
+            f"msg_type      = {self.msg_type} ({self.msg_type_name()}),",
+        ]
+
+        if self.msg_type == self.MessageType.CALL:
+            assert self.program is not None
+            assert self.prog_version is not None
+            assert self.procedure is not None
+            assert self.cred is not None
+            lines += [
+                f"rpc_version   = {self.rpc_version},",
+                f"program       = {self.program} ({self.program_name()}),",
+                f"prog_version  = {self.prog_version},",
+                f"procedure     = {self.procedure},",
+                f"cred_flavor   = {self.cred['flavor']},",
+            ]
+            if "machine" in self.cred:
+                lines += [
+                    f"cred_machine  = {self.cred['machine']},",
+                    f"cred_uid      = {self.cred['uid']},",
+                    f"cred_gid      = {self.cred['gid']},",
+                ]
+
+        elif self.msg_type == self.MessageType.REPLY:
+            lines.append(f"reply_status  = {self.reply_status},")
+            if self.accept_status is not None:
+                lines.append(
+                    f"accept_status = {self.accept_status} ({self.accept_status_name()}),"
+                )
+            if self.reject_status is not None:
+                lines.append(f"reject_status = {self.reject_status},")
+
+        return "\n".join(lines) + "\n"
+
+
+class NFSv4:
+    """NFSv4 parser — RFC 7530.
+    NFSv4 encodes operations as a sequence of (op_code, args) pairs
+    inside the RPC payload.
+    """
+
+    class Procedure(IntEnum):
+        NULL = 0  # no-op / ping
+        COMPOUND = 1  # all NFSv4 ops are sent as compound procedures
+
+    class OpCode(IntEnum):
+        ACCESS = 3
+        CLOSE = 4
+        COMMIT = 5
+        CREATE = 6
+        DELEGPURGE = 7
+        DELEGRETURN = 8
+        GETATTR = 9
+        GETFH = 10
+        LINK = 11
+        LOCK = 12
+        LOCKT = 13
+        LOCKU = 14
+        LOOKUP = 15
+        LOOKUPP = 16
+        NVERIFY = 17
+        OPEN = 18
+        OPENATTR = 19
+        OPEN_CONFIRM = 20
+        OPEN_DOWNGRADE = 21
+        PUTFH = 22
+        PUTPUBFH = 23
+        PUTROOTFH = 24
+        READ = 25
+        READDIR = 26
+        READLINK = 27
+        REMOVE = 28
+        RENAME = 29
+        RENEW = 30
+        RESTOREFH = 31
+        SAVEFH = 32
+        SECINFO = 33
+        SETATTR = 34
+        SETCLIENTID = 35
+        SETCLIENTID_CONFIRM = 36
+        VERIFY = 37
+        WRITE = 38
+        RELEASE_LOCKOWNER = 39
+
+    class NFSStatus(IntEnum):
+        OK = 0
+        PERM = 1
+        NOENT = 2
+        IO = 5
+        NXIO = 6
+        ACCES = 13
+        EXIST = 17
+        XDEV = 18
+        NODEV = 19
+        NOTDIR = 20
+        ISDIR = 21
+        INVAL = 22
+        FBIG = 27
+        NOSPC = 28
+        ROFS = 30
+        MLINK = 31
+        NAMETOOLONG = 63
+        NOTEMPTY = 66
+        DQUOT = 69
+        STALE = 70
+        BADHANDLE = 10001
+        NOT_SYNC = 10002
+        BAD_COOKIE = 10003
+        NOTSUPP = 10004
+        TOOSMALL = 10005
+        SERVERFAULT = 10006
+        BADTYPE = 10007
+        DELAY = 10008
+        SAME = 10009
+        DENIED = 10010
+        EXPIRED = 10011
+        LOCKED = 10012
+        GRACE = 10013
+        FHEXPIRED = 10014
+        SHARE_DENIED = 10015
+        WRONGSEC = 10016
+        CLID_INUSE = 10017
+        RESOURCE = 10018
+        MOVED = 10019
+        NOFILEHANDLE = 10020
+        MINOR_VERS_MISMATCH = 10021
+        STALE_CLIENTID = 10022
+        STALE_STATEID = 10023
+        OLD_STATEID = 10024
+        BAD_STATEID = 10025
+        BAD_SEQID = 10026
+        NOT_SAME = 10027
+        LOCK_RANGE = 10028
+        SYMLINK = 10029
+        RESTOREFH = 10030
+        LEASE_MOVED = 10031
+        ATTRNOTSUPP = 10032
+        NO_GRACE = 10033
+        RECLAIM_BAD = 10034
+        RECLAIM_CONFLICT = 10035
+        BADXDR = 10036
+        LOCKS_HELD = 10037
+        OPENMODE = 10038
+        BADOWNER = 10039
+        BADCHAR = 10040
+        BADNAME = 10041
+        BAD_RANGE = 10042
+        LOCK_NOTSUPP = 10043
+        OP_ILLEGAL = 10044
+        DEADLOCK = 10045
+        FILE_OPEN = 10046
+        ADMIN_REVOKED = 10047
+        CB_PATH_DOWN = 10048
+
+    class WriteStable(IntEnum):
+        UNSTABLE = 0
+        DATA_SYNC = 1
+        FILE_SYNC = 2
+
+    def __init__(self, rpc: ONC_RPC) -> None:
+        data = rpc.data
+
+        if rpc.msg_type == ONC_RPC.MessageType.CALL:
+            self._parse_call(data, rpc.procedure)
+        else:
+            self._parse_reply(data)
+
+    def _read_str(self, data: bytes, offset: int) -> tuple[str, int]:
+        """Read an XDR variable-length string.
+        [ Length (4B) ][ Data (Length B) ][ Padding to 4B boundary ]
+        """
+        length = int.from_bytes(data[offset : offset + 4], "big")
+        offset += 4
+        value = data[offset : offset + length].decode("utf-8", errors="replace")
+        offset += length
+        offset += (4 - length % 4) % 4  # XDR 4-byte alignment padding
+        return value, offset
+
+    def _read_opaque(self, data: bytes, offset: int) -> tuple[bytes, int]:
+        """Read XDR variable-length opaque bytes.
+        [ Length (4B) ][ Data (Length B) ][ Padding to 4B boundary ]
+        """
+        length = int.from_bytes(data[offset : offset + 4], "big")
+        offset += 4
+        value = data[offset : offset + length]
+        offset += length
+        offset += (4 - length % 4) % 4
+        return value, offset
+
+    def _parse_call(self, data: bytes, procedure: int | None) -> None:
+        """Parse NFSv4 COMPOUND call — sequence of operations."""
+        self.status = None
+        self.operations = []
+
+        if procedure == self.Procedure.NULL:
+            self.tag = "NULL"
+            self.minor_version = None
+            return
+
+        # COMPOUND: [ Tag (str) ][ Minor Version (4B) ][ Op Count (4B) ][ Ops... ]
+        offset = 0
+        self.tag, offset = self._read_str(data, offset)
+        self.minor_version = int.from_bytes(data[offset : offset + 4], "big")
+        offset += 4
+        op_count = int.from_bytes(data[offset : offset + 4], "big")
+        offset += 4
+
+        for _ in range(op_count):
+            if offset + 4 > len(data):
+                break
+            op_code = int.from_bytes(data[offset : offset + 4], "big")
+            offset += 4
+            op, offset = self._parse_op_call(data, offset, op_code)
+            self.operations.append(op)
+
+    def _parse_reply(self, data: bytes) -> None:
+        """Parse NFSv4 COMPOUND reply — status + sequence of op results."""
+        self.minor_version = None
+        self.operations = []
+
+        if len(data) < 4:
+            self.status = None
+            self.tag = ""
+            return
+
+        # COMPOUND reply: [ Status (4B) ][ Tag (str) ][ Op Count (4B) ][ Results... ]
+        offset = 0
+        self.status = int.from_bytes(data[offset : offset + 4], "big")
+        offset += 4
+        self.tag, offset = self._read_str(data, offset)
+        op_count = int.from_bytes(data[offset : offset + 4], "big")
+        offset += 4
+
+        for _ in range(op_count):
+            if offset + 8 > len(data):
+                break
+            op_code = int.from_bytes(data[offset : offset + 4], "big")
+            offset += 4
+            status = int.from_bytes(data[offset : offset + 4], "big")
+            offset += 4
+            op, offset = self._parse_op_reply(data, offset, op_code, status)
+            self.operations.append(op)
+
+    def _parse_op_call(
+        self, data: bytes, offset: int, op_code: int
+    ) -> tuple[dict, int]:
+        """Parse a single NFSv4 operation argument."""
+        op: dict = {"op_code": op_code, "op_name": self._op_name(op_code)}
+
+        try:
+            if op_code == self.OpCode.LOOKUP:
+                # [ Name (str) ]
+                name, offset = self._read_str(data, offset)
+                op["name"] = name
+
+            elif op_code == self.OpCode.OPEN:
+                # [ Sequence ID (4B) ][ Share Access (4B) ][ Share Deny (4B) ]
+                op["seq_id"] = int.from_bytes(data[offset : offset + 4], "big")
+                offset += 4
+                op["share_access"] = int.from_bytes(data[offset : offset + 4], "big")
+                offset += 4
+                op["share_deny"] = int.from_bytes(data[offset : offset + 4], "big")
+                offset += 4
+
+            elif op_code == self.OpCode.READ:
+                # [ Stateid (16B) ][ Offset (8B) ][ Count (4B) ]
+                op["stateid"] = data[offset : offset + 16].hex()
+                offset += 16
+                op["offset"] = int.from_bytes(data[offset : offset + 8], "big")
+                offset += 8
+                op["count"] = int.from_bytes(data[offset : offset + 4], "big")
+                offset += 4
+
+            elif op_code == self.OpCode.WRITE:
+                # [ Stateid (16B) ][ Offset (8B) ][ Stable (4B) ][ Data (opaque) ]
+                op["stateid"] = data[offset : offset + 16].hex()
+                offset += 16
+                op["offset"] = int.from_bytes(data[offset : offset + 8], "big")
+                offset += 8
+                op["stable"] = int.from_bytes(data[offset : offset + 4], "big")
+                offset += 4
+                data_bytes, offset = self._read_opaque(data, offset)
+                op["data_len"] = len(data_bytes)
+
+            elif op_code == self.OpCode.REMOVE:
+                # [ Name (str) ]
+                name, offset = self._read_str(data, offset)
+                op["name"] = name
+
+            elif op_code == self.OpCode.RENAME:
+                # [ Old Name (str) ][ New Name (str) ]
+                old, offset = self._read_str(data, offset)
+                new, offset = self._read_str(data, offset)
+                op["old_name"] = old
+                op["new_name"] = new
+
+            elif op_code == self.OpCode.SETCLIENTID:
+                # [ Client Verifier (8B) ][ Client ID (opaque) ]
+                op["verifier"] = data[offset : offset + 8].hex()
+                offset += 8
+                client_id, offset = self._read_opaque(data, offset)
+                op["client_id"] = client_id.hex()
+
+            elif op_code == self.OpCode.GETATTR:
+                # [ Attr Bitmap (variable 4B words) ]
+                word_count = int.from_bytes(data[offset : offset + 4], "big")
+                offset += 4
+                bitmap = [
+                    int.from_bytes(data[offset + i * 4 : offset + i * 4 + 4], "big")
+                    for i in range(word_count)
+                ]
+                offset += word_count * 4
+                op["attr_bitmap"] = [hex(b) for b in bitmap]
+
+        except IndexError, struct.error:
+            pass
+
+        return op, offset
+
+    def _parse_op_reply(
+        self, data: bytes, offset: int, op_code: int, status: int
+    ) -> tuple[dict, int]:
+        """Parse a single NFSv4 operation result."""
+        op: dict = {
+            "op_code": op_code,
+            "op_name": self._op_name(op_code),
+            "status": status,
+            "status_name": self._status_name(status),
+        }
+
+        if status != self.NFSStatus.OK:
+            return op, offset
+
+        try:
+            if op_code == self.OpCode.READ:
+                # [ EOF (4B) ][ Data (opaque) ]
+                op["eof"] = bool(int.from_bytes(data[offset : offset + 4], "big"))
+                offset += 4
+                rd, offset = self._read_opaque(data, offset)
+                op["data_len"] = len(rd)
+
+            elif op_code == self.OpCode.WRITE:
+                # [ Count (4B) ][ Stable (4B) ][ Verifier (8B) ]
+                op["count"] = int.from_bytes(data[offset : offset + 4], "big")
+                offset += 4
+                op["stable"] = int.from_bytes(data[offset : offset + 4], "big")
+                offset += 4
+                op["verifier"] = data[offset : offset + 8].hex()
+                offset += 8
+
+            elif op_code == self.OpCode.GETFH:
+                # [ File Handle (opaque) ]
+                fh, offset = self._read_opaque(data, offset)
+                op["filehandle"] = fh.hex()
+
+            elif op_code == self.OpCode.SETCLIENTID:
+                # [ Client ID (8B) ][ Verifier (8B) ]
+                op["client_id"] = int.from_bytes(data[offset : offset + 8], "big")
+                offset += 8
+                op["verifier"] = data[offset : offset + 8].hex()
+                offset += 8
+
+        except IndexError, struct.error:
+            pass
+
+        return op, offset
+
+    def _op_name(self, op_code: int) -> str:
+        try:
+            return self.OpCode(op_code).name
+        except ValueError:
+            return f"Unknown ({op_code})"
+
+    def _status_name(self, status: int) -> str:
+        try:
+            return self.NFSStatus(status).name
+        except ValueError:
+            return f"Unknown ({status})"
+
+    def __str__(self) -> str:
+        lines = ["--- NFSv4 ".ljust(50, "-")]
+
+        if self.status is not None:
+            lines.append(
+                f"status        = {self.status} ({self._status_name(self.status)}),"
+            )
+        if self.tag:
+            lines.append(f"tag           = {self.tag!r},")
+        if self.minor_version is not None:
+            lines.append(f"minor_version = {self.minor_version},")
+
+        if self.operations:
+            lines.append("\n  Operations:")
+            for op in self.operations:
+                line = f"    {op['op_name']:<24}"
+                if "status" in op:
+                    line += f" [{op['status_name']}]"
+                for key, val in op.items():
+                    if key not in ("op_code", "op_name", "status", "status_name"):
+                        line += f"  {key}={val}"
+                lines.append(line)
+
+        return "\n".join(lines) + "\n"
+
+
 @app.command()
 def main(file: Annotated[str, typer.Argument(help="Raw packet binary file")]):
     # Read raw packet file
@@ -1744,6 +2315,16 @@ def main(file: Annotated[str, typer.Argument(help="Raw packet binary file")]):
             if tcp.data:
                 http = HTTP(tcp.data)
                 typer.echo(http)
+
+        elif tcp.src_port == Port.NFS or tcp.dst_port == Port.NFS:
+            if tcp.data:
+                # TCP carries RPC with a 4-byte Record Marking header — skip it
+                rpc_data = tcp.data[4:] if len(tcp.data) > 4 else tcp.data
+                rpc = ONC_RPC(rpc_data)
+                typer.echo(rpc)
+                if rpc.program == 100003:  # NFS program number
+                    nfs = NFSv4(rpc)
+                    typer.echo(nfs)
 
     elif protocol == Protocol.ICMPv4:
         if len(pkg.data) < 8:
