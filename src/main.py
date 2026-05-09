@@ -1,20 +1,27 @@
 #!/usr/bin/env python3
 
+from enum import IntEnum
 from typing import Annotated
 import typer
 import socket
 
 app = typer.Typer()
 
-# EtherType constants
-TYPE_IPv4 = 0x0800
-TYPE_IPv6 = 0x86DD
-TYPE_ARP = 0x0806
 
-# IPv4 protocol constants
-PROTO_ICMP = 1
-PROTO_TCP = 6
-PROTO_UDP = 17
+class EtherType(IntEnum):
+    """IEEE 802.3 EtherType field values."""
+
+    IPv4 = 0x0800
+    IPv6 = 0x86DD
+    ARP = 0x0806
+
+
+class Protocol(IntEnum):
+    """IANA IP protocol numbers (IPv4 protocol / IPv6 next header)."""
+
+    ICMP = 1
+    TCP = 6
+    UDP = 17
 
 
 class EthernetFrame:
@@ -248,21 +255,21 @@ def main(file: Annotated[str, typer.Argument(help="Raw packet binary file")]):
     # Parse network layer
     pkg: IPv4 | IPv6 | None = None
 
-    if frame.type == TYPE_IPv4:
+    if frame.type == EtherType.IPv4:
         if len(frame.data) < 20:
             typer.echo("Error: IPv4 payload too short.", err=True)
             raise typer.Exit(1)
         pkg = IPv4(frame.data)
         typer.echo(pkg)
 
-    elif frame.type == TYPE_IPv6:
+    elif frame.type == EtherType.IPv6:
         if len(frame.data) < 40:
             typer.echo("Error: IPv6 payload too short.", err=True)
             raise typer.Exit(1)
         pkg = IPv6(frame.data)
         typer.echo(pkg)
 
-    elif frame.type == TYPE_ARP:
+    elif frame.type == EtherType.ARP:
         typer.echo("ARP packet detected — no further parsing implemented.")
         raise typer.Exit(0)
 
@@ -274,21 +281,21 @@ def main(file: Annotated[str, typer.Argument(help="Raw packet binary file")]):
     protocol = pkg.protocol if isinstance(pkg, IPv4) else pkg.next_header
 
     # Parse transport layer
-    if protocol == PROTO_UDP:
+    if protocol == Protocol.UDP:
         if len(pkg.data) < 8:
             typer.echo("Error: UDP datagram too short.", err=True)
             raise typer.Exit(1)
         udp = UDP(pkg.data)
         typer.echo(udp)
 
-    elif protocol == PROTO_TCP:
+    elif protocol == Protocol.TCP:
         if len(pkg.data) < 20:
             typer.echo("Error: TCP segment too short.", err=True)
             raise typer.Exit(1)
         tcp = TCP(pkg.data)
         typer.echo(tcp)
 
-    elif protocol == PROTO_ICMP:
+    elif protocol == Protocol.ICMP:
         typer.echo("ICMP packet detected — no further parsing implemented.")
 
     else:
