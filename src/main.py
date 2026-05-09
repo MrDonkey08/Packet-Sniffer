@@ -22,6 +22,7 @@ class Protocol(IntEnum):
     ICMPv4 = 1
     TCP = 6
     UDP = 17
+    ICMPv6 = 58
 
 
 class EthernetFrame:
@@ -138,6 +139,80 @@ class IPv6:
             f"dst         = {self.format_ip(self.dst_ip)},\n"
             f"next_header = {self.next_header},\n"
             f"hop_limit   = {self.hop_limit}\n"
+        )
+
+
+class ARP:
+    """ARP parser — RFC 826."""
+
+    class HardwareType(IntEnum):
+        ETHERNET = 1
+        IEEE_802 = 6
+
+    class Operation(IntEnum):
+        REQUEST = 1
+        REPLY = 2
+
+    def __init__(self, segment: bytes) -> None:
+        # ARP packet structure:
+        # [ HTYPE (2B) ][ PTYPE (2B) ][ HLEN (1B) ][ PLEN (1B) ][ OPER (2B) ]
+        # [ SHA (HLEN B) ][ SPA (PLEN B) ][ THA (HLEN B) ][ TPA (PLEN B) ]
+        self.htype = int.from_bytes(segment[0:2], "big")  # hardware type
+        self.ptype = int.from_bytes(
+            segment[2:4], "big"
+        )  # protocol type (same as EtherType)
+        self.hlen = segment[4]  # hardware address length (e.g., 6 for MAC)
+        self.plen = segment[5]  # protocol address length (e.g., 4 for IPv4)
+        self.oper = int.from_bytes(segment[6:8], "big")  # operation (request/reply)
+
+        # Sender and target addresses are variable length based on hlen/plen
+        offset = 8
+        self.sha = segment[offset : offset + self.hlen]
+        offset += self.hlen  # sender hardware address
+        self.spa = segment[offset : offset + self.plen]
+        offset += self.plen  # sender protocol address
+        self.tha = segment[offset : offset + self.hlen]
+        offset += self.hlen  # target hardware address
+        self.tpa = segment[offset : offset + self.plen]  # target protocol address
+
+    def htype_name(self) -> str:
+        try:
+            return self.HardwareType(self.htype).name.replace("_", " ").title()
+        except ValueError:
+            return f"Unknown ({self.htype})"
+
+    def oper_name(self) -> str:
+        try:
+            return self.Operation(self.oper).name.title()
+        except ValueError:
+            return f"Unknown ({self.oper})"
+
+    def format_mac(self, mac: bytes) -> str:
+        return mac.hex(":")
+
+    def format_ip(self, ip: bytes) -> str:
+        return socket.inet_ntoa(ip)
+
+    def format_proto(self, addr: bytes) -> str:
+        if self.ptype == EtherType.IPv4 and len(addr) == 4:
+            return socket.inet_ntoa(addr)
+        # Fallback for IPv6 or unknown protocol types
+        if self.ptype == EtherType.IPv6 and len(addr) == 16:
+            return socket.inet_ntop(socket.AF_INET6, addr)
+        return addr.hex(":")
+
+    def __str__(self) -> str:
+        return (
+            "--- ARP ".ljust(50, "-") + "\n"
+            f"htype      = {self.htype} ({self.htype_name()}),\n"
+            f"ptype      = {hex(self.ptype)},\n"
+            f"hlen       = {self.hlen},\n"
+            f"plen       = {self.plen},\n"
+            f"operation  = {self.oper} ({self.oper_name()}),\n"
+            f"sender MAC = {self.format_mac(self.sha)},\n"
+            f"sender IP  = {self.format_proto(self.spa)},\n"
+            f"target MAC = {self.format_mac(self.tha)},\n"
+            f"target IP  = {self.format_proto(self.tpa)}\n"
         )
 
 
@@ -371,6 +446,197 @@ class ICMPv4:
         return "\n".join(lines) + "\n"
 
 
+class ICMPv6:
+    """ICMPv6 parser — RFC 4443 (base) + RFC 4861 (NDP)."""
+
+    class Type(IntEnum):
+        # Error messages (0-127)
+        DEST_UNREACHABLE = 1
+        PACKET_TOO_BIG = 2
+        TIME_EXCEEDED = 3
+        PARAMETER_PROBLEM = 4
+        # Informational messages (128-255)
+        ECHO_REQUEST = 128
+        ECHO_REPLY = 129
+        # Neighbor Discovery Protocol — RFC 4861
+        ROUTER_SOLICITATION = 133
+        ROUTER_ADVERTISEMENT = 134
+        NEIGHBOR_SOLICITATION = 135
+        NEIGHBOR_ADVERTISEMENT = 136
+        REDIRECT = 137
+
+    class CodeDestUnreachable(IntEnum):
+        NO_ROUTE = 0
+        ADMIN_PROHIBITED = 1
+        BEYOND_SCOPE = 2
+        ADDRESS_UNREACHABLE = 3
+        PORT_UNREACHABLE = 4
+        POLICY_FAIL = 5
+        REJECT_ROUTE = 6
+
+    class CodeTimeExceeded(IntEnum):
+        HOP_LIMIT_EXCEEDED = 0
+        FRAGMENT_REASSEMBLY = 1
+
+    class CodeParameterProblem(IntEnum):
+        ERRONEOUS_HEADER = 0
+        UNKNOWN_NEXT_HEADER = 1
+        UNKNOWN_OPTION = 2
+
+    def __init__(self, segment: bytes) -> None:
+        # ICMPv6 base header structure (8 bytes fixed):
+        # [ Type (1B) ][ Code (1B) ][ Checksum (2B) ][ Rest of Header (4B) ]
+        self.type = segment[0]
+        self.code = segment[1]
+        self.checksum = int.from_bytes(segment[2:4], "big")
+
+        rest = segment[4:8]
+
+        # Error messages — carry the original invoking packet after byte 8
+        self.original_datagram = None
+
+        if self.type == self.Type.DEST_UNREACHABLE:
+            # [ Unused (4B) ]
+            pass
+
+        elif self.type == self.Type.PACKET_TOO_BIG:
+            # [ MTU (4B) ]
+            self.mtu = int.from_bytes(rest[0:4], "big")
+
+        elif self.type == self.Type.TIME_EXCEEDED:
+            # [ Unused (4B) ]
+            pass
+
+        elif self.type == self.Type.PARAMETER_PROBLEM:
+            # [ Pointer (4B) ] — byte offset of the offending field
+            self.pointer = int.from_bytes(rest[0:4], "big")
+
+        elif self.type in (self.Type.ECHO_REQUEST, self.Type.ECHO_REPLY):
+            # [ Identifier (2B) ][ Sequence Number (2B) ]
+            self.identifier = int.from_bytes(rest[0:2], "big")
+            self.sequence_num = int.from_bytes(rest[2:4], "big")
+
+        elif self.type == self.Type.ROUTER_SOLICITATION:
+            # [ Reserved (4B) ][ Options (variable) ]
+            self.ndp_options = segment[8:]
+
+        elif self.type == self.Type.ROUTER_ADVERTISEMENT:
+            # [ Cur Hop Limit (1B) ][ Flags (1B) ][ Router Lifetime (2B) ]
+            # [ Reachable Time (4B) ][ Retrans Timer (4B) ][ Options (variable) ]
+            self.cur_hop_limit = rest[0]
+            ra_flags = rest[1]
+            self.ra_flag_managed = bool(ra_flags & 0x80)  # M bit
+            self.ra_flag_other = bool(ra_flags & 0x40)  # O bit
+            self.router_lifetime = int.from_bytes(rest[2:4], "big")
+            self.reachable_time = int.from_bytes(segment[8:12], "big")
+            self.retrans_timer = int.from_bytes(segment[12:16], "big")
+            self.ndp_options = segment[16:]
+
+        elif self.type == self.Type.NEIGHBOR_SOLICITATION:
+            # [ Reserved (4B) ][ Target Address (16B) ][ Options (variable) ]
+            self.target_addr = segment[8:24]
+            self.ndp_options = segment[24:]
+
+        elif self.type == self.Type.NEIGHBOR_ADVERTISEMENT:
+            # [ Flags (4B) ][ Target Address (16B) ][ Options (variable) ]
+            na_flags = int.from_bytes(rest[0:4], "big")
+            self.na_flag_router = bool(na_flags & 0x80000000)  # R bit
+            self.na_flag_solicited = bool(na_flags & 0x40000000)  # S bit
+            self.na_flag_override = bool(na_flags & 0x20000000)  # O bit
+            self.target_addr = segment[8:24]
+            self.ndp_options = segment[24:]
+
+        elif self.type == self.Type.REDIRECT:
+            # [ Reserved (4B) ][ Target Address (16B) ][ Dest Address (16B) ][ Options ]
+            self.target_addr = segment[8:24]
+            self.dest_addr = segment[24:40]
+            self.ndp_options = segment[40:]
+
+        # All error messages (Type 1-4) carry the invoking packet after byte 8
+        if 1 <= self.type <= 4:
+            self.original_datagram = segment[8:]
+
+        self.data = segment[8:]
+
+    def format_ip(self, ip: bytes) -> str:
+        return socket.inet_ntop(socket.AF_INET6, ip)
+
+    def type_name(self) -> str:
+        try:
+            return self.Type(self.type).name.replace("_", " ").title()
+        except ValueError:
+            return f"Unknown ({self.type})"
+
+    def code_name(self) -> str:
+        try:
+            if self.type == self.Type.DEST_UNREACHABLE:
+                return (
+                    self.CodeDestUnreachable(self.code).name.replace("_", " ").title()
+                )
+            elif self.type == self.Type.TIME_EXCEEDED:
+                return self.CodeTimeExceeded(self.code).name.replace("_", " ").title()
+            elif self.type == self.Type.PARAMETER_PROBLEM:
+                return (
+                    self.CodeParameterProblem(self.code).name.replace("_", " ").title()
+                )
+            return str(self.code)
+        except ValueError:
+            return f"Unknown ({self.code})"
+
+    def __str__(self) -> str:
+        lines = [
+            "--- ICMPv6 ".ljust(50, "-"),
+            f"type          = {self.type} ({self.type_name()}),",
+            f"code          = {self.code} ({self.code_name()}),",
+            f"checksum      = {hex(self.checksum)},",
+        ]
+
+        if self.type == self.Type.PACKET_TOO_BIG:
+            lines.append(f"mtu           = {self.mtu},")
+
+        elif self.type == self.Type.PARAMETER_PROBLEM:
+            lines.append(f"pointer       = {self.pointer},")
+
+        elif self.type in (self.Type.ECHO_REQUEST, self.Type.ECHO_REPLY):
+            lines += [
+                f"identifier    = {self.identifier},",
+                f"sequence_num  = {self.sequence_num},",
+            ]
+
+        elif self.type == self.Type.ROUTER_ADVERTISEMENT:
+            lines += [
+                f"cur_hop_limit = {self.cur_hop_limit},",
+                f"flag_managed  = {self.ra_flag_managed},",
+                f"flag_other    = {self.ra_flag_other},",
+                f"router_lifetime = {self.router_lifetime},",
+                f"reachable_time  = {self.reachable_time},",
+                f"retrans_timer   = {self.retrans_timer},",
+            ]
+
+        elif self.type in (
+            self.Type.NEIGHBOR_SOLICITATION,
+            self.Type.NEIGHBOR_ADVERTISEMENT,
+        ):
+            lines.append(f"target_addr   = {self.format_ip(self.target_addr)},")
+            if self.type == self.Type.NEIGHBOR_ADVERTISEMENT:
+                lines += [
+                    f"flag_router   = {self.na_flag_router},",
+                    f"flag_solicited= {self.na_flag_solicited},",
+                    f"flag_override = {self.na_flag_override},",
+                ]
+
+        elif self.type == self.Type.REDIRECT:
+            lines += [
+                f"target_addr   = {self.format_ip(self.target_addr)},",
+                f"dest_addr     = {self.format_ip(self.dest_addr)},",
+            ]
+
+        if self.original_datagram:
+            lines.append(f"original_dgram= {self.original_datagram[:8].hex()} ...,")
+
+        return "\n".join(lines) + "\n"
+
+
 @app.command()
 def main(file: Annotated[str, typer.Argument(help="Raw packet binary file")]):
     # Read raw packet file
@@ -410,7 +676,11 @@ def main(file: Annotated[str, typer.Argument(help="Raw packet binary file")]):
         typer.echo(pkg)
 
     elif frame.type == EtherType.ARP:
-        typer.echo("ARP packet detected — no further parsing implemented.")
+        if len(frame.data) < 8:
+            typer.echo("Error: ARP packet too short.", err=True)
+            raise typer.Exit(1)
+        arp = ARP(frame.data)
+        typer.echo(arp)
         raise typer.Exit(0)
 
     else:
@@ -440,6 +710,13 @@ def main(file: Annotated[str, typer.Argument(help="Raw packet binary file")]):
             typer.echo("Error: ICMP segment too short.", err=True)
             raise typer.Exit(1)
         icmp = ICMPv4(pkg.data)
+        typer.echo(icmp)
+
+    elif protocol == Protocol.ICMPv6:
+        if len(pkg.data) < 8:
+            typer.echo("Error: ICMPv6 segment too short.", err=True)
+            raise typer.Exit(1)
+        icmp = ICMPv6(pkg.data)
         typer.echo(icmp)
 
     else:
