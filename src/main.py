@@ -43,10 +43,11 @@ class EthernetFrame:
 
     def __repr__(self) -> str:
         return (
-            f"EthernetFrame(src={self.format_mac(self.src_mac)}, "
-            f"dst={self.format_mac(self.dst_mac)}, "
-            f"type={hex(self.type)}, "
-            f"vlan={self.vlan_tag.hex() if self.vlan_tag else None})"
+            "--- EthernetFrame ".ljust(50, "-") + "\n"
+            f"src  = {self.format_mac(self.src_mac)},\n"
+            f"dst  = {self.format_mac(self.dst_mac)},\n"
+            f"type = {hex(self.type)},\n"
+            f"vlan = {self.vlan_tag.hex() if self.vlan_tag else None}\n"
         )
 
 
@@ -91,10 +92,13 @@ class IPv4:
 
     def __repr__(self) -> str:
         return (
-            f"IPv4(src={self.format_ip(self.src_ip)}, "
-            f"dst={self.format_ip(self.dst_ip)}, "
-            f"proto={self.protocol}, ttl={self.ttl}, "
-            f"flags={bin(self.flags)}, frag_offset={self.fragment_offset})"
+            "--- IPv4 ".ljust(50, "-") + "\n"
+            f"src         = {self.format_ip(self.src_ip)},\n"
+            f"dst         = {self.format_ip(self.dst_ip)},\n"
+            f"proto       = {self.protocol},\n"
+            f"ttl         = {self.ttl},\n"
+            f"flags       = {bin(self.flags)},\n"
+            f"frag_offset = {self.fragment_offset}\n"
         )
 
 
@@ -122,9 +126,11 @@ class IPv6:
 
     def __repr__(self) -> str:
         return (
-            f"IPv6(src={self.format_ip(self.src_ip)}, "
-            f"dst={self.format_ip(self.dst_ip)}, "
-            f"next_header={self.next_header}, hop_limit={self.hop_limit})"
+            "--- IPv6 ".ljust(50, "-") + "\n"
+            f"src         = {self.format_ip(self.src_ip)},\n"
+            f"dst         = {self.format_ip(self.dst_ip)},\n"
+            f"next_header = {self.next_header},\n"
+            f"hop_limit   = {self.hop_limit}\n"
         )
 
 
@@ -142,8 +148,11 @@ class UDP:
 
     def __repr__(self) -> str:
         return (
-            f"UDP(src_port={self.src_port}, dst_port={self.dst_port}, "
-            f"length={self.length}, checksum={hex(self.checksum)})"
+            "--- UDP ".ljust(50, "-") + "\n"
+            f"src_port = {self.src_port},\n"
+            f"dst_port = {self.dst_port},\n"
+            f"length   = {self.length},\n"
+            f"checksum = {hex(self.checksum)}\n"
         )
 
 
