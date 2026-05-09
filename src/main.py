@@ -19,7 +19,7 @@ class EtherType(IntEnum):
 class Protocol(IntEnum):
     """IANA IP protocol numbers (IPv4 protocol / IPv6 next header)."""
 
-    ICMP = 1
+    ICMPv4 = 1
     TCP = 6
     UDP = 17
 
@@ -231,6 +231,146 @@ class TCP:
         )
 
 
+class ICMPv4:
+    # Type constants
+    class Type(IntEnum):
+        ECHO_REPLY = 0
+        DEST_UNREACHABLE = 3
+        REDIRECT = 5
+        ECHO_REQUEST = 8
+        TIME_EXCEEDED = 11
+        PARAMETER_PROBLEM = 12
+        TIMESTAMP_REQUEST = 13
+        TIMESTAMP_REPLY = 14
+
+    # Destination Unreachable codes (Type 3)
+    class CodeDestUnreachable(IntEnum):
+        NET_UNREACHABLE = 0
+        HOST_UNREACHABLE = 1
+        PROTO_UNREACHABLE = 2
+        PORT_UNREACHABLE = 3
+        FRAGMENTATION_NEEDED = 4
+        SOURCE_ROUTE_FAILED = 5
+
+    # Time Exceeded codes (Type 11)
+    class CodeTimeExceeded(IntEnum):
+        TTL_EXCEEDED = 0
+        FRAGMENT_REASSEMBLY = 1
+
+    # Redirect codes (Type 5)
+    class CodeRedirect(IntEnum):
+        REDIRECT_NET = 0
+        REDIRECT_HOST = 1
+        REDIRECT_TOS_NET = 2
+        REDIRECT_TOS_HOST = 3
+
+    def __init__(self, segment: bytes) -> None:
+        # ICMPv4 base header structure (8 bytes fixed):
+        # [ Type (1B) ][ Code (1B) ][ Checksum (2B) ][ Rest of Header (4B) ]
+        # "Rest of Header" is type-dependent
+        self.type = segment[0]
+        self.code = segment[1]
+        self.checksum = int.from_bytes(segment[2:4], "big")
+
+        # Bytes 4-7 are type-dependent
+        rest = segment[4:8]
+
+        # Type-specific fields
+        if self.type in (self.Type.ECHO_REQUEST, self.Type.ECHO_REPLY):
+            # [ Identifier (2B) ][ Sequence Number (2B) ]
+            self.identifier = int.from_bytes(rest[0:2], "big")
+            self.sequence_num = int.from_bytes(rest[2:4], "big")
+
+        elif self.type == self.Type.DEST_UNREACHABLE:
+            # [ Unused (2B) ][ Next-Hop MTU (2B) ] (RFC 1191)
+            self.next_hop_mtu = int.from_bytes(rest[2:4], "big")
+
+        elif self.type == self.Type.REDIRECT:
+            # [ Gateway IP (4B) ]
+            self.gateway_ip = rest[0:4]
+
+        elif (
+            self.type == self.Type.TIMESTAMP_REQUEST
+            or self.type == self.Type.TIMESTAMP_REPLY
+        ):
+            # [ Identifier (2B) ][ Sequence Number (2B) ]
+            # Followed by Originate, Receive, Transmit timestamps (4B each)
+            self.identifier = int.from_bytes(rest[0:2], "big")
+            self.sequence_num = int.from_bytes(rest[2:4], "big")
+            self.originate_ts = int.from_bytes(segment[8:12], "big")
+            self.receive_ts = int.from_bytes(segment[12:16], "big")
+            self.transmit_ts = int.from_bytes(segment[16:20], "big")
+
+        # Original IP header + first 8 bytes of original datagram
+        # present in error messages (Type 3, 5, 11, 12)
+        if self.type in (
+            self.Type.DEST_UNREACHABLE,
+            self.Type.REDIRECT,
+            self.Type.TIME_EXCEEDED,
+            self.Type.PARAMETER_PROBLEM,
+        ):
+            self.original_datagram = segment[8:]
+        else:
+            self.original_datagram = None
+
+        self.data = segment[8:]
+
+    def type_name(self) -> str:
+        try:
+            return self.Type(self.type).name.replace("_", " ").title()
+        except ValueError:
+            return f"Unknown ({self.type})"
+
+    def code_name(self) -> str:
+        try:
+            if self.type == self.Type.DEST_UNREACHABLE:
+                return (
+                    self.CodeDestUnreachable(self.code).name.replace("_", " ").title()
+                )
+            elif self.type == self.Type.TIME_EXCEEDED:
+                return self.CodeTimeExceeded(self.code).name.replace("_", " ").title()
+            elif self.type == self.Type.REDIRECT:
+                return self.CodeRedirect(self.code).name.replace("_", " ").title()
+            return str(self.code)
+        except ValueError:
+            return f"Unknown ({self.code})"
+
+    def format_ip(self, ip: bytes) -> str:
+        return socket.inet_ntoa(ip)
+
+    def __str__(self) -> str:
+        lines = [
+            "--- ICMPv4 ".ljust(50, "-"),
+            f"type          = {self.type} ({self.type_name()}),",
+            f"code          = {self.code} ({self.code_name()}),",
+            f"checksum      = {hex(self.checksum)},",
+        ]
+
+        # Type-specific fields
+        if self.type in (self.Type.ECHO_REQUEST, self.Type.ECHO_REPLY):
+            lines += [
+                f"identifier    = {self.identifier},",
+                f"sequence_num  = {self.sequence_num},",
+            ]
+        elif self.type == self.Type.DEST_UNREACHABLE:
+            lines.append(f"next_hop_mtu  = {self.next_hop_mtu},")
+        elif self.type == self.Type.REDIRECT:
+            lines.append(f"gateway_ip    = {self.format_ip(self.gateway_ip)},")
+        elif self.type in (self.Type.TIMESTAMP_REQUEST, self.Type.TIMESTAMP_REPLY):
+            lines += [
+                f"identifier    = {self.identifier},",
+                f"sequence_num  = {self.sequence_num},",
+                f"originate_ts  = {self.originate_ts},",
+                f"receive_ts    = {self.receive_ts},",
+                f"transmit_ts   = {self.transmit_ts},",
+            ]
+
+        if self.original_datagram:
+            lines.append(f"original_dgram= {self.original_datagram[:8].hex()} ...,")
+
+        return "\n".join(lines) + "\n"
+
+
 @app.command()
 def main(file: Annotated[str, typer.Argument(help="Raw packet binary file")]):
     # Read raw packet file
@@ -295,8 +435,12 @@ def main(file: Annotated[str, typer.Argument(help="Raw packet binary file")]):
         tcp = TCP(pkg.data)
         typer.echo(tcp)
 
-    elif protocol == Protocol.ICMP:
-        typer.echo("ICMP packet detected — no further parsing implemented.")
+    elif protocol == Protocol.ICMPv4:
+        if len(pkg.data) < 8:
+            typer.echo("Error: ICMP segment too short.", err=True)
+            raise typer.Exit(1)
+        icmp = ICMPv4(pkg.data)
+        typer.echo(icmp)
 
     else:
         typer.echo(f"Unsupported transport protocol: {protocol}", err=True)
