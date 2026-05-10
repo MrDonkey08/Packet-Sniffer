@@ -1,0 +1,86 @@
+# See https://pre-commit.com for more information
+# See https://pre-commit.com/hooks.html for more hooks
+
+# yaml-language-server: $schema=https://json.schemastore.org/pre-commit-config.json
+default_install_hook_types:
+  - pre-commit
+  - commit-msg
+
+default_stages:
+  - pre-commit
+
+repos:
+  # --- General hygiene --------------------------------------------------------
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      # Whitespace / line endings
+      - id: trailing-whitespace
+        args: [--markdown-linebreak-ext=md]
+      - id: end-of-file-fixer
+      - id: mixed-line-ending
+        args: [--fix=lf]
+
+      # File sanity
+      # - id: check-added-large-files
+      - id: check-symlinks
+      - id: destroyed-symlinks
+
+      # Secrets / security
+      - id: detect-private-key
+
+      # Data formats
+      - id: check-toml
+      - id: check-yaml
+      - id: check-json
+      - id: pretty-format-json
+        args: [--autofix, --no-sort-keys]
+
+      # Executable bits
+      - id: check-executables-have-shebangs
+      - id: check-shebang-scripts-are-executable
+
+      # Windows
+      - id: check-illegal-windows-names
+
+  # --- Prettier (TOML, Markdown, YAML, JSON) ----------------------------------
+  - repo: https://github.com/pre-commit/mirrors-prettier
+    rev: v4.0.0-alpha.8
+    hooks:
+      - id: prettier
+        types_or: [markdown, yaml, toml, json]
+        additional_dependencies:
+          - prettier@3.5.3
+          - "prettier-plugin-toml@2.0.1"
+
+  # --- Ruff (Python) ----------------------------------------------------------
+
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.15.12
+    hooks:
+      - id: ruff
+        args: [--fix]
+      - id: ruff-format
+
+  # --- Mirrors (Python) -------------------------------------------------------
+
+  - repo: https://github.com/pre-commit/mirrors-mypy
+    rev: v2.0.0
+    hooks:
+      - id: mypy
+        additional_dependencies: []
+
+  # --- Bandit (Python) --------------------------------------------------------
+
+  - repo: https://github.com/PyCQA/bandit
+    rev: 1.9.4
+    hooks:
+      - id: bandit
+        args: ["-c", "pyproject.toml"]
+
+  # --- Yelp (detect secrets) --------------------------------------------------------
+
+  - repo: https://github.com/Yelp/detect-secrets
+    rev: v1.5.0
+    hooks:
+      - id: detect-secrets

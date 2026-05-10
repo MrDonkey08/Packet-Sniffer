@@ -15,7 +15,7 @@ class EthernetFrame:
         # 802.1Q VLAN tag (optional): EtherType 0x8100 means a 4B tag is inserted
         # before the real EtherType
         if self.type == 0x8100:
-            self.vlan_tag = frame[14:16]  # PCP (3b), DEI (1b), VID (12b)
+            self.vlan_tag: bytes | None = frame[14:16]  # PCP (3b), DEI (1b), VID (12b)
             self.type = int.from_bytes(frame[16:18], "big")
             self.data = frame[18:-4]
         else:

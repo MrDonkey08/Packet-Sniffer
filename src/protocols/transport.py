@@ -155,6 +155,7 @@ class ICMPv4:
 
         # Original IP header + first 8 bytes of original datagram
         # present in error messages (Type 3, 5, 11, 12)
+        self.original_datagram: bytes | None
         if self.type in (
             self.Type.DEST_UNREACHABLE,
             self.Type.REDIRECT,
@@ -268,7 +269,8 @@ class ICMPv6:
 
         rest = segment[4:8]
 
-        self.original_datagram = None
+        # Declared up front: only populated for error message types (1–4)
+        self.original_datagram: bytes | None = None
 
         if self.type == self.Type.DEST_UNREACHABLE:
             pass  # [ Unused (4B) ]

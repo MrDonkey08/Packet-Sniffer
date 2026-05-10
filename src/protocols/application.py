@@ -137,6 +137,8 @@ class DNS:
         }, offset
 
     def _decode_rdata(self, data: bytes, rtype: int, rdata: bytes, offset: int) -> str:
+        # Falls back to hex on any parsing error — malformed rdata is expected in
+        # the wild, so the except branch returns rather than passing silently.
         try:
             if rtype == self.QType.A:
                 return socket.inet_ntoa(rdata)
@@ -171,8 +173,8 @@ class DNS:
                 port = int.from_bytes(rdata[4:6], "big")
                 target, _ = self._parse_name(data, offset + 6)
                 return f"{priority} {weight} {port} {target}"
-        except Exception:
-            pass
+        except ValueError, IndexError, struct.error, UnicodeDecodeError, OSError:
+            return rdata.hex()
         return rdata.hex()
 
     def qtype_name(self, qtype: int) -> str:
@@ -516,9 +518,9 @@ class DHCPv6:
 
         if self.msg_type in (self.MessageType.RELAY_FORW, self.MessageType.RELAY_REPL):
             # [ Msg Type (1B) ][ Hop Count (1B) ][ Link Address (16B) ][ Peer Address (16B) ]
-            self.hop_count = data[1]
-            self.link_address = data[2:18]
-            self.peer_address = data[18:34]
+            self.hop_count: int | None = data[1]
+            self.link_address: bytes | None = data[2:18]
+            self.peer_address: bytes | None = data[18:34]
             self.options = self._parse_options(data[34:])
             self.xid = None
         else:
@@ -679,9 +681,11 @@ class DHCPv6:
         ]
         if self.xid is not None:
             lines.append(f"xid           = {hex(self.xid)},")
-        if self.hop_count is not None:
-            assert self.link_address is not None
-            assert self.peer_address is not None
+        if (
+            self.hop_count is not None
+            and self.link_address is not None
+            and self.peer_address is not None
+        ):
             lines += [
                 f"hop_count     = {self.hop_count},",
                 f"link_address  = {socket.inet_ntop(socket.AF_INET6, self.link_address)},",
@@ -739,13 +743,21 @@ class HTTP:
         lines = header_section.split("\r\n")
         start_line = lines[0]
 
+        # Declare all fields up front so mypy sees a consistent type across
+        # both the request and response parse paths.
+        self.is_request: bool = False
+        self.is_response: bool = False
+        self.method: str | None = None
+        self.uri: str | None = None
+        self.version: str = "?"
+        self.status_code: int | None = None
+        self.reason_phrase: str | None = None
+
         if start_line.startswith("HTTP/"):
             self.is_response = True
-            self.is_request = False
             self._parse_response(start_line)
         else:
             self.is_request = True
-            self.is_response = False
             self._parse_request(start_line)
 
         self.headers: dict[str, str] = {}
@@ -763,8 +775,6 @@ class HTTP:
         self.method = parts[0] if len(parts) > 0 else "?"
         self.uri = parts[1] if len(parts) > 1 else "?"
         self.version = parts[2] if len(parts) > 2 else "?"
-        self.status_code = None
-        self.reason_phrase = None
 
     def _parse_response(self, start_line: str) -> None:
         """Parse HTTP response line — [ Version ][ SP ][ Status Code ][ SP ][ Reason ]"""
@@ -774,8 +784,6 @@ class HTTP:
             int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else None
         )
         self.reason_phrase = parts[2] if len(parts) > 2 else "?"
-        self.method = None
-        self.uri = None
 
     def _decode_chunked(self, body: str) -> str:
         """Decode chunked transfer encoding — RFC 7230 section 4.1."""
@@ -870,6 +878,18 @@ class ONC_RPC:
         self.msg_type = int.from_bytes(data[4:8], "big")
         offset = 8
 
+        # Declare all optional fields up front so mypy sees consistent types
+        # regardless of which parse path (CALL vs REPLY) is taken.
+        self.rpc_version: int | None = None
+        self.program: int | None = None
+        self.prog_version: int | None = None
+        self.procedure: int | None = None
+        self.cred: dict | None = None
+        self.verf: dict | None = None
+        self.reply_status: int | None = None
+        self.accept_status: int | None = None
+        self.reject_status: int | None = None
+
         if self.msg_type == self.MessageType.CALL:
             offset = self._parse_call(data, offset)
         elif self.msg_type == self.MessageType.REPLY:
@@ -920,29 +940,20 @@ class ONC_RPC:
         offset += 4
         self.cred, offset = self._parse_auth(data, offset)
         self.verf, offset = self._parse_auth(data, offset)
-        self.reply_status = self.accept_status = self.reject_status = None
         return offset
 
     def _parse_reply(self, data: bytes, offset: int) -> int:
         """[ Reply Status (4B) ][ Verifier or Reject Status ][ Accept Status ]"""
         self.reply_status = int.from_bytes(data[offset : offset + 4], "big")
         offset += 4
-        self.rpc_version = self.program = self.prog_version = self.procedure = (
-            self.cred
-        ) = None
 
         if self.reply_status == self.ReplyStatus.MSG_ACCEPTED:
             self.verf, offset = self._parse_auth(data, offset)
             self.accept_status = int.from_bytes(data[offset : offset + 4], "big")
             offset += 4
-            self.reject_status = None
         elif self.reply_status == self.ReplyStatus.MSG_DENIED:
-            self.verf = None
-            self.accept_status = None
             self.reject_status = int.from_bytes(data[offset : offset + 4], "big")
             offset += 4
-        else:
-            self.verf = self.accept_status = self.reject_status = None
 
         return offset
 
@@ -953,6 +964,8 @@ class ONC_RPC:
             return f"Unknown ({self.msg_type})"
 
     def accept_status_name(self) -> str:
+        if self.accept_status is None:
+            return "N/A"
         try:
             return self.AcceptStatus(self.accept_status).name.replace("_", " ").title()
         except ValueError:
@@ -974,11 +987,13 @@ class ONC_RPC:
             f"xid           = {hex(self.xid)},",
             f"msg_type      = {self.msg_type} ({self.msg_type_name()}),",
         ]
-        if self.msg_type == self.MessageType.CALL:
-            assert self.program is not None
-            assert self.prog_version is not None
-            assert self.procedure is not None
-            assert self.cred is not None
+        if (
+            self.msg_type == self.MessageType.CALL
+            and self.program is not None
+            and self.prog_version is not None
+            and self.procedure is not None
+            and self.cred is not None
+        ):
             lines += [
                 f"rpc_version   = {self.rpc_version},",
                 f"program       = {self.program} ({self.program_name()}),",
@@ -1126,6 +1141,13 @@ class NFSv4:
 
     def __init__(self, rpc: ONC_RPC) -> None:
         data = rpc.data
+
+        # Declare all fields up front for consistent typing across both paths.
+        self.status: int | None = None
+        self.tag: str = ""
+        self.minor_version: int | None = None
+        self.operations: list[dict] = []
+
         if rpc.msg_type == ONC_RPC.MessageType.CALL:
             self._parse_call(data, rpc.procedure)
         else:
@@ -1150,11 +1172,8 @@ class NFSv4:
         return value, offset
 
     def _parse_call(self, data: bytes, procedure: int | None) -> None:
-        self.status = None
-        self.operations = []
         if procedure == self.Procedure.NULL:
             self.tag = "NULL"
-            self.minor_version = None
             return
 
         offset = 0
@@ -1173,11 +1192,7 @@ class NFSv4:
             self.operations.append(op)
 
     def _parse_reply(self, data: bytes) -> None:
-        self.minor_version = None
-        self.operations = []
         if len(data) < 4:
-            self.status = None
-            self.tag = ""
             return
 
         offset = 0
